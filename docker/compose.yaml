@@ -1,3 +1,6 @@
+x-common-vars: &ros2-vars
+  environment:
+
 services:
   hackathon-vision-server-ws:
     build:
