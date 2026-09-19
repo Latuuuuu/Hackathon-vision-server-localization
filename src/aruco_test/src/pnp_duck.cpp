@@ -11,8 +11,10 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 
@@ -24,8 +26,9 @@
 //   pose_topic          : free 6-DoF PnP (IPPE_SQUARE), z is estimated
 //   plane_lm.pose_topic : PnP result moved along its viewing ray onto z = target_height, then refined by
 //                         3-DoF (x, y, yaw) LM on image reprojection error with the tag kept level
-//   final_pose_topic    : the final localization output (/pose/global): plane LM result, raw PnP when the
-//                         LM is disabled or not available for this frame
+//   final_pose_topic    : the final localization output (/pose/global), PoseWithCovarianceStamped:
+//                         plane LM result, raw PnP when the LM is disabled or not available for this
+//                         frame. The covariance is a fixed guess from final_pose_cov.* (see param.yaml)
 class PnpDuckNode : public rclcpp::Node {
 public:
     PnpDuckNode() : Node("pnp_duck_node") {
@@ -38,6 +41,12 @@ public:
         this->declare_parameter<bool>("plane_lm.enable", true);
         this->declare_parameter<std::string>("plane_lm.pose_topic", "/pose/global/pnp_plane_lm");
         this->declare_parameter<std::string>("final_pose_topic", "/pose/global");
+        // Fixed 1-sigma guesses for the final pose; x/y are dominated by the extrinsic and the table
+        // size (mm level), not by the per-frame LM jitter (~0.1 mm). roll/pitch/z are assumed, not measured.
+        this->declare_parameter<double>("final_pose_cov.sigma_xy_m", 0.005);
+        this->declare_parameter<double>("final_pose_cov.sigma_z_m", 0.01);
+        this->declare_parameter<double>("final_pose_cov.sigma_yaw_deg", 1.0);
+        this->declare_parameter<double>("final_pose_cov.sigma_roll_pitch_deg", 5.0);
         this->declare_parameter<int>("plane_lm.max_iter", 15);
         this->declare_parameter<std::string>("world_frame", "map");
         this->declare_parameter<std::string>("camera_frame", "camera_color_optical_frame");
@@ -57,6 +66,18 @@ public:
         plane_lm_enable_ = this->get_parameter("plane_lm.enable").as_bool();
         plane_lm_pose_topic_ = this->get_parameter("plane_lm.pose_topic").as_string();
         final_pose_topic_ = this->get_parameter("final_pose_topic").as_string();
+        const double sigma_xy = this->get_parameter("final_pose_cov.sigma_xy_m").as_double();
+        const double sigma_z = this->get_parameter("final_pose_cov.sigma_z_m").as_double();
+        const double sigma_yaw = this->get_parameter("final_pose_cov.sigma_yaw_deg").as_double() * M_PI / 180.0;
+        const double sigma_rp = this->get_parameter("final_pose_cov.sigma_roll_pitch_deg").as_double() * M_PI / 180.0;
+        // Row-major 6x6 over (x, y, z, roll, pitch, yaw)
+        final_pose_cov_.fill(0.0);
+        final_pose_cov_[0] = sigma_xy * sigma_xy;
+        final_pose_cov_[7] = sigma_xy * sigma_xy;
+        final_pose_cov_[14] = sigma_z * sigma_z;
+        final_pose_cov_[21] = sigma_rp * sigma_rp;
+        final_pose_cov_[28] = sigma_rp * sigma_rp;
+        final_pose_cov_[35] = sigma_yaw * sigma_yaw;
         plane_lm_max_iter_ = this->get_parameter("plane_lm.max_iter").as_int();
         world_frame_ = this->get_parameter("world_frame").as_string();
         camera_frame_ = this->get_parameter("camera_frame").as_string();
@@ -95,7 +116,8 @@ public:
             plane_lm_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(plane_lm_pose_topic_, 10);
         }
         if (!final_pose_topic_.empty()) {
-            final_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(final_pose_topic_, 10);
+            final_pose_pub_ =
+                this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(final_pose_topic_, 10);
         }
 
         // TODO: compare DICT_4X4_100 / APRILTAG_36h11 / APRILTAG_16h5 accuracy (see TODO.md)
@@ -414,7 +436,12 @@ private:
 
                 // Final localization output
                 if (final_pose_pub_) {
-                    final_pose_pub_->publish(is_lm_valid ? lm_pose_msg : pose_msg);
+                    const geometry_msgs::msg::PoseStamped &best = is_lm_valid ? lm_pose_msg : pose_msg;
+                    geometry_msgs::msg::PoseWithCovarianceStamped final_msg;
+                    final_msg.header = best.header;
+                    final_msg.pose.pose = best.pose;
+                    final_msg.pose.covariance = final_pose_cov_;
+                    final_pose_pub_->publish(final_msg);
                 }
             }
         }
@@ -497,8 +524,9 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_subscriber_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr plane_lm_pose_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr final_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr final_pose_pub_;
     std::string final_pose_topic_;
+    std::array<double, 36> final_pose_cov_{};
     std::string RGB_topic_;
     std::string camera_info_topic_;
     std::string pose_topic_;

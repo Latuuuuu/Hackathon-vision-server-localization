@@ -4,12 +4,16 @@
 
 | 節點 | 方法 | 輸出 |
 |---|---|---|
-| `homography_duck_node` | tag 固定在已知高度的水平面上（3 DoF：x, y, yaw） | `/pose/global/homography`（閉式解）、`/duck/pose/plane_lm`（LM refine） |
-| `pnp_duck_node` | solvePnP 自由 6 DoF，再轉到 map；再以 PnP 為初值做平面約束 LM | **`/pose/global`（最終定位輸出 = LM refine，LM 不可用時退回原始 PnP）**、`/pose/global/pnp`（原始 PnP）、`/pose/global/pnp_plane_lm`（LM refine） |
+| `homography_duck_node` | tag 固定在已知高度的水平面上（3 DoF：x, y, yaw）（比較用） | `/pose/global/homography`（閉式解）、`/duck/pose/plane_lm`（LM refine） |
+| `pnp_duck_node` | solvePnP 自由 6 DoF，再轉到 map；再以 PnP 為初值做平面約束 LM | **`/pose/global`（最終定位輸出，`PoseWithCovarianceStamped` = LM refine，LM 不可用時退回原始 PnP）**、`/pose/global/pnp`（原始 PnP）、`/pose/global/pnp_plane_lm`（LM refine） |
 
 ---
 
 ## 1. 系統總覽
+
+一張圖版本：[docs/localization_flow.png](docs/localization_flow.png)（原始檔 [docs/localization_flow.dot](docs/localization_flow.dot)，重畫：`dot -Tpng -Gdpi=130 docs/localization_flow.dot -o docs/localization_flow.png`）
+
+![定位架構](docs/localization_flow.png)
 
 ```mermaid
 flowchart LR
@@ -36,7 +40,7 @@ flowchart LR
     HD -- "/duck/pose/plane_lm" --> OUT
     PD["pnp_duck_node"] -- "/pose/global/pnp" --> OUT
     PD -- "/pose/global/pnp_plane_lm" --> OUT
-    PD == "/pose/global（最終輸出）" ==> OUT
+    PD == "/pose/global（最終輸出<br/>PoseWithCovarianceStamped）" ==> OUT
     HD -. "debug: TF homo_duck_1 / plane_lm_duck_1" .-> TF
     PD -. "debug: TF pnp_duck_1 / pnp_plane_lm_duck_1" .-> TF
 ```
@@ -113,7 +117,7 @@ flowchart TD
     RAY --> LM["3-DoF LM refine (x, y, yaw)<br/>殘差 = projectPoints(含畸變) − raw corners<br/>tag 限制在 z=h 水平面（共用 plane_lm.hpp）"]
     LM --> F2["pose_filter（EMA，獨立 state）"]
     F2 --> P2[/"plane_lm.pose_topic<br/>z 固定 = target_height"/]
-    P2 --> PF[/"final_pose_topic = /pose/global<br/>（LM 不可用時改發原始 PnP）"/]
+    P2 --> PF[/"final_pose_topic = /pose/global<br/>PoseWithCovarianceStamped<br/>covariance 由 final_pose_cov.* 給固定值<br/>（LM 不可用時改發原始 PnP）"/]
     P1 -. "LM 不可用時" .-> PF
 
     P1 --> DBG
@@ -253,3 +257,16 @@ python3 tools/calib/field_edge_calib.py --selftest   # synthetic image, init off
   深度初值與舊 TF 初值收斂到同一個解（差 0.5 mm / 0.014°），採用 87%、inlier RMS 0.84 px（right_1 被人擋住）。
 - 深度量到的桌面範圍 1.877 × 1.245 m（輸入 1.8 × 1.2），深度高度 1.315 m vs 桌緣解 1.302 m。
   兩者都約大 1–4%，仍無法分辨是深度尺度誤差還是桌子實際尺寸，需實際量桌子。
+
+### /pose/global 的 covariance（2026-09-20）
+
+型別是 `geometry_msgs/PoseWithCovarianceStamped`，covariance 是**參數給的固定值**（`final_pose_cov.*`，對角線，row-major x, y, z, roll, pitch, yaw）：
+
+| 參數 | 預設 | 理由 |
+|---|---:|---|
+| `sigma_xy_m` | 0.005 | 每幀 LM 抖動只有約 0.1 mm，但外參與桌子尺寸誤差是 mm 等級（實測不同次校正之間，平面對應差最多 3.8 mm），所以取保守值 |
+| `sigma_z_m` | 0.01 | z 是假設等於 `target_height`，不是量出來的 |
+| `sigma_yaw_deg` | 1.0 | |
+| `sigma_roll_pitch_deg` | 5.0 | roll/pitch 直接假設為 0（tag 水平） |
+
+不是從影像殘差推算的，所以遮擋或 tag 距離變化不會反映在數值上；要改精度就改參數。
