@@ -37,7 +37,10 @@ debug 畫面一律用 image topic 發布（不開 OpenCV 視窗），用 `rqt_im
 | `/field_calib_node/debug/image` | **主要看這個**：平常是 live overlay；校正時逐輪顯示，完成後停在結果 `calib.hold_s` 秒（預設 15）再回到 live |
 | `/field_calib_node/live/overlay` | 只有 live overlay |
 | `/field_calib_node/calib/{overlay,strips,residuals}` | 最近一次校正（每輪都會更新） |
+| `/field_calib_node/{live,calib}/overlay/compressed` | `live.compact:=true` 時才有的 JPEG（`sensor_msgs/CompressedImage`，format `bgr8; jpeg compressed bgr8`） |
 | `/pnp_duck_node/debug/image`、`/homography_duck_node/debug/image` | 定位節點的 debug 畫面（`debug.img:=true` 時才發布，topic 可用 `debug.img_topic` 改） |
+
+沒有訂閱者的 topic 不會畫圖也不會編碼，省 CPU。
 
 容器目前沒有 `rqt_image_view`，要用的話先安裝 `ros-humble-rqt-image-view`，或在 RViz 加 Image display。
 
@@ -49,7 +52,25 @@ debug 畫面一律用 image topic 發布（不開 OpenCV 視窗），用 `rqt_im
 | 沒有結果檔 | 自動校正一次，通過檢查才發布 |
 | `map → camera_link` 已經有別人在發布 | terminal 警告（通常是 `rs_launch.py cam_tf.enable:=true`），兩者會互相覆蓋，請關掉一個 |
 
-### 1.3 重新校正
+### 1.3 高頻串流（給 App / 瀏覽器）
+
+未壓縮的完整版疊圖是 1740×820、每張 4.2 MB，實測用 **BEST_EFFORT 訂閱根本收不到**（UDP 片段被丟），只有 RELIABLE 收得到。要給 App 連續看畫面時開 compact：
+
+```bash
+ros2 launch field_calib field_calib.launch.py \
+    field_file:=/home/vision/vision_ws/tools/calib/field_app.yaml \
+    live.compact:=true live.period:=0.1
+```
+
+| | 預設 | `live.compact:=true` |
+|---|---|---|
+| `~/live/overlay`、`~/calib/overlay`、`~/debug/image` | 完整版 1740×820（含右側面板） | 精簡版，尺寸等於相機原圖（1280×720），左上角一行 `band / acc` |
+| `~/{live,calib}/overlay/compressed` | 沒有這個 topic | JPEG，`live.jpeg_quality` 預設 80 |
+| 寫進 `debug_dir` 的 PNG | 完整版 | **仍是完整版**（App 結果頁讀 `final_overlay.png`） |
+
+實測（合成場景、`live.period:=0.1`）：compressed 10.0 Hz、每張 106–144 KB、BEST_EFFORT 訂閱收得到。
+
+### 1.4 重新校正
 
 - `ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger`，在 `/field_calib_node/debug/image` 看過程與結果。
 - 相機被移動也可以直接校正：初值同時來自
@@ -64,7 +85,7 @@ debug 畫面一律用 image topic 發布（不開 OpenCV 視窗），用 `rqt_im
 - 每次校正的 debug 圖與結果存在 `tools/calib/out/ros/<時間>/`：`<depth|tf>_band_*`、`final_*`、`cam_tf.yaml`。
 - 只想試算、不想動到 TF：`calib.apply:=false`（dry run）。
 
-### 1.4 原點約定
+### 1.5 原點約定
 
 - X 沿桌子長邊，Y 沿併排方向，Z 向上，z=0 是桌面。
 - 長方形合法的原點角有兩個（對角），**取離相機正下方較遠的那個**。以目前場地來說，就是上方桌子的右上角。
@@ -189,6 +210,8 @@ python3 tools/calib/field_edge_calib.py --selftest     # 合成影像自我測�
 | `calib.min_accept_ratio` / `calib.max_rms_px` | 0.6 / 1.5 | 低於／高於門檻就不套用 |
 | `calib.apply` | true | false = dry run，不發布 TF、不寫結果檔 |
 | `live.band` / `live.period` | 12 / 1.0 | live 檢查的搜尋範圍與更新週期 |
+| `live.compact` | false | true：疊圖改成相機原圖尺寸，並發布 JPEG compressed topic |
+| `live.jpeg_quality` | 80 | compressed topic 的 JPEG 品質 |
 | `calib.hold_s` | 15.0 | 校正完成後 `~/debug/image` 停在結果畫面的秒數 |
 
 桌子尺寸、角落排除距離、接縫、各桌 x 偏移在 `src/field_calib/config/field.yaml`。

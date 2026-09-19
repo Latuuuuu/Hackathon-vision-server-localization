@@ -57,7 +57,8 @@ def _legend(img, org):
     return y
 
 
-def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
+def _draw_scene(img_bgr, field, K, D, stage):
+    """Drawing on the camera image itself (shared by the full and the compact overlay)."""
     diag, band = stage['diag'], stage['band']
     p0, p1 = stage['p_before'], stage['p_after']
     canvas = img_bgr.copy()
@@ -96,6 +97,23 @@ def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
     o, x, y = _project([[0, 0, 0], [0.2, 0, 0], [0, 0.2, 0]], p1, K, D)
     cv2.arrowedLine(canvas, tuple(np.round(o).astype(int)), tuple(np.round(x).astype(int)), (0, 0, 255), 2)
     cv2.arrowedLine(canvas, tuple(np.round(o).astype(int)), tuple(np.round(y).astype(int)), (0, 255, 0), 2)
+    return canvas
+
+
+def render_overlay_compact(img_bgr, field, K, D, stage, title=''):
+    """Same size as the camera image: edges, samples and axes, no side panel.
+    Cheap enough (and small enough as JPEG) for a >= 10 Hz live stream."""
+    canvas = _draw_scene(img_bgr, field, K, D, stage)
+    acc = core.stage_quality(stage)['accept_ratio']
+    _text(canvas, f'{title + "  " if title else ""}band {stage["band"]:.0f}px  acc {acc * 100:.0f}%', (10, 22),
+          0.6, (0, 255, 255))
+    return canvas
+
+
+def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
+    diag, band = stage['diag'], stage['band']
+    p0, p1 = stage['p_before'], stage['p_after']
+    canvas = _draw_scene(img_bgr, field, K, D, stage)
 
     # Side panel: corner zooms + stats
     h, w = canvas.shape[:2]

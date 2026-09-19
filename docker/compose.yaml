@@ -1,6 +1,6 @@
 x-common-vars: &ros2-vars
   environment:
-    - ROS_DOMAIN_ID=0
+    - ROS_DOMAIN_ID=59
 
 services:
   hackathon-vision-server-ws:

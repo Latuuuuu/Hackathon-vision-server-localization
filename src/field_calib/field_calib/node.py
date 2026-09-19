@@ -8,8 +8,12 @@ live (timer)          : edge search + residuals under the current TF (no optimiz
                         -> if it passes the basic checks: publish map -> camera_link (static TF) and save
                         it to calib.result_file. Every band is published to ~/calib/* and saved as PNG.
 startup               : publish the saved result; if there is none, calibrate once (calib.on_startup).
+live.compact          : overlays published at camera size without the side panel (+ JPEG on
+                        ~/live/overlay/compressed and ~/calib/overlay/compressed) for >= 10 Hz streaming;
+                        PNGs written to the calibration debug_dir stay the full version.
 This node is the only publisher of map -> camera_link (rs_launch.py cam_tf.enable defaults to false).
 """
+import array
 import datetime
 import os
 import threading
@@ -25,7 +29,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from geometry_msgs.msg import TransformStamped
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
@@ -33,6 +37,7 @@ from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
 from . import core, debug_viz
 
 VIEWS = ('overlay', 'strips', 'residuals')
+JPEG_FORMAT = 'bgr8; jpeg compressed bgr8'  # same as image_transport compressed
 CAM_TF_NAMES = ('x', 'y', 'z', 'roll', 'pitch', 'yaw')
 
 
@@ -84,6 +89,8 @@ class FieldCalibNode(Node):
         dp('live.band', 12.0)
         dp('live.warn_rms_px', 1.5)
         dp('live.warn_inlier_ratio', 0.7)
+        dp('live.compact', False)     # camera-size overlays (no side panel) + JPEG compressed topics
+        dp('live.jpeg_quality', 80)
         dp('depth.enable', True)
         dp('depth.frames', 10)
         dp('tag.id', 1)
@@ -104,8 +111,10 @@ class FieldCalibNode(Node):
         self.latest = None
         self.frames = None      # list while collecting for a calibration
         self.depth_frames = None
-        self.calib_views = None
+        self.calib_views = None   # views published on ~/calib/* (compact overlay when live.compact)
+        self.calib_jpeg = None    # encoded calib overlay, re-sent without re-encoding
         self.live_views = None
+        self.timer_ticks = 0
         self.show_calib_until = 0.0  # ~/debug/image shows the calibration result until this time
         self.busy = False
 
@@ -120,6 +129,12 @@ class FieldCalibNode(Node):
                      for kind, vs in (('live', ('overlay',)), ('calib', VIEWS)) for v in vs}
         # What an operator watches: live overlay, or the calibration stages / result
         self.debug_pub = self.create_publisher(Image, '~/debug/image', 1)
+        self.compact = bool(self.p('live.compact'))
+        self.jpeg_pubs = {}
+        if self.compact:
+            # Same QoS as the raw overlays (reliable, keep last 1)
+            self.jpeg_pubs = {kind: self.create_publisher(CompressedImage, f'~/{kind}/overlay/compressed', 1)
+                              for kind in ('live', 'calib')}
         self.create_service(Trigger, '~/calibrate', self.on_calibrate,
                             callback_group=MutuallyExclusiveCallbackGroup())
         self.create_timer(self.p('live.period'), self.on_timer, callback_group=MutuallyExclusiveCallbackGroup())
@@ -239,16 +254,60 @@ class FieldCalibNode(Node):
         R_wc, t_wc = self.lookup(self.p('world_frame'), self.p('optical_frame'))
         return core.pose_from_world_cam(R_wc, t_wc)  # 6-DoF; callers extend it for their field
 
-    def publish_views(self, kind, views, header):
-        for name, im in views.items():
-            msg = self.bridge.cv2_to_imgmsg(im, 'bgr8')
-            msg.header = header
-            self.pubs[f'{kind}/{name}'].publish(msg)
+    @staticmethod
+    def has_subs(pub):
+        return pub is not None and pub.get_subscription_count() > 0
 
-    def publish_debug(self, im, header):
+    def publish_image(self, pub, im, header):
+        """Convert and publish only when someone listens (large images)."""
+        if not self.has_subs(pub):
+            return
         msg = self.bridge.cv2_to_imgmsg(im, 'bgr8')
         msg.header = header
-        self.debug_pub.publish(msg)
+        pub.publish(msg)
+
+    def publish_views(self, kind, views, header):
+        for name, im in views.items():
+            self.publish_image(self.pubs[f'{kind}/{name}'], im, header)
+
+    def publish_debug(self, im, header):
+        self.publish_image(self.debug_pub, im, header)
+
+    def encode_jpeg(self, im):
+        ok, buf = cv2.imencode('.jpg', im, [cv2.IMWRITE_JPEG_QUALITY, int(self.p('live.jpeg_quality'))])
+        if not ok:
+            return None
+        # array('B') is taken as-is by the uint8[] field; bytes would be checked value by value
+        data = array.array('B')
+        data.frombytes(buf.tobytes())
+        return data
+
+    def publish_jpeg(self, kind, data, header):
+        pub = self.jpeg_pubs.get(kind)
+        if data is None or not self.has_subs(pub):
+            return
+        msg = CompressedImage()
+        msg.header = header
+        msg.format = JPEG_FORMAT
+        msg.data = data
+        pub.publish(msg)
+
+    def overlay_for_publish(self, img, field, stage, title):
+        """Overlay sent on the topics: compact (camera size) or the full debug version."""
+        if self.compact:
+            return debug_viz.render_overlay_compact(img, field, self.K, self.D, stage, title)
+        return debug_viz.render_overlay(img, field, self.K, self.D, stage, self.p('lm.delta'), title)
+
+    def publish_calib(self, views, header):
+        """Store and publish the calibration views of one stage (or the final result)."""
+        jpeg = None
+        if self.compact and self.has_subs(self.jpeg_pubs['calib']):
+            jpeg = self.encode_jpeg(views['overlay'])
+        with self.lock:
+            self.calib_views, self.calib_jpeg = views, jpeg
+        self.publish_views('calib', views, header)
+        self.publish_jpeg('calib', jpeg, header)
+        self.publish_debug(views['overlay'], header)
 
     def blurred(self, img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -261,10 +320,22 @@ class FieldCalibNode(Node):
         if latest is None or self.K is None:
             return
         img, header = latest
-        if self.calib_views is not None:
-            self.publish_views('calib', self.calib_views, header)  # keep the last result visible
+        # Keep the last calibration result visible, re-sent about once per second whatever live.period is
+        period = self.p('live.period')
+        resend = self.timer_ticks % max(1, round(1.0 / period)) == 0 if period > 0 else True
+        self.timer_ticks += 1
+        with self.lock:
+            calib_views, calib_jpeg = self.calib_views, self.calib_jpeg
+        if calib_views is not None and resend:
+            self.publish_views('calib', calib_views, header)
+            if self.compact and calib_jpeg is None and self.has_subs(self.jpeg_pubs['calib']):
+                calib_jpeg = self.encode_jpeg(calib_views['overlay'])  # subscriber came later
+                with self.lock:
+                    if self.calib_views is calib_views:
+                        self.calib_jpeg = calib_jpeg
+            self.publish_jpeg('calib', calib_jpeg, header)
             if not busy and time.time() < self.show_calib_until:
-                self.publish_debug(self.calib_views['overlay'], header)
+                self.publish_debug(calib_views['overlay'], header)
         if busy or not self.p('live.enable'):
             return
         field = self.field
@@ -276,13 +347,18 @@ class FieldCalibNode(Node):
         stage = core.evaluate(self.blurred(img), field, p, self.K, self.D, self.p('live.band'),
                               self.p('edge.step'), self.p('edge.grad_thresh'), self.p('edge.contrast_thresh'),
                               self.p('lm.delta'))
-        views = {'overlay': debug_viz.render_overlay(img, field, self.K, self.D, stage,
-                                                     self.p('lm.delta'), 'live')}
-        with self.lock:
-            self.live_views = views
-        self.publish_views('live', views, header)
-        if time.time() >= self.show_calib_until:
-            self.publish_debug(views['overlay'], header)
+        show_debug = time.time() >= self.show_calib_until
+        want_raw = self.has_subs(self.pubs['live/overlay']) or (show_debug and self.has_subs(self.debug_pub))
+        want_jpeg = self.has_subs(self.jpeg_pubs.get('live'))
+        if want_raw or want_jpeg:  # drawing is the expensive part: skip it when nobody watches
+            views = {'overlay': self.overlay_for_publish(img, field, stage, 'live')}
+            with self.lock:
+                self.live_views = views
+            self.publish_views('live', views, header)
+            if show_debug:
+                self.publish_debug(views['overlay'], header)
+            if want_jpeg:
+                self.publish_jpeg('live', self.encode_jpeg(views['overlay']), header)
         d = stage['diag']
         considered = d['status'] != core.OUT_OF_IMAGE
         acc = d['status'] == core.ACCEPTED
@@ -382,13 +458,14 @@ class FieldCalibNode(Node):
         results = []
         for name, p0 in candidates:
             def on_stage(stage, name=name):
-                views = debug_viz.render_all(med, field, self.K, self.D, stage, delta, f'calib ({name} init)')
-                for v, im in views.items():
+                title = f'calib ({name} init)'
+                views = debug_viz.render_all(med, field, self.K, self.D, stage, delta, title)
+                for v, im in views.items():  # PNGs are always the full version
                     cv2.imwrite(os.path.join(debug_dir, f'{name}_band_{stage["index"]}_{stage["band"]:.0f}px_{v}.png'),
                                 im)
-                self.calib_views = views
-                self.publish_views('calib', views, header)
-                self.publish_debug(views['overlay'], header)
+                if self.compact:
+                    views = dict(views, overlay=self.overlay_for_publish(med, field, stage, title))
+                self.publish_calib(views, header)
                 time.sleep(self.p('calib.stage_delay'))  # let viewers see every stage
 
             log(f'calibrating from {len(frames)} frames, {name} init, debug images -> {debug_dir}')
@@ -417,13 +494,13 @@ class FieldCalibNode(Node):
         if not q['rms'] <= self.p('calib.max_rms_px'):
             problems.append(f'inlier RMS {q["rms"]:.2f} px > {self.p("calib.max_rms_px")} px')
         passed = not problems
-        views = debug_viz.render_all(med, field, self.K, self.D, stage, delta,
-                                     'calib PASS' if passed else 'calib FAIL: ' + '; '.join(problems))
-        for v, im in views.items():
+        title = 'calib PASS' if passed else 'calib FAIL: ' + '; '.join(problems)
+        views = debug_viz.render_all(med, field, self.K, self.D, stage, delta, title)
+        for v, im in views.items():  # final_overlay.png stays the full version (read by the App)
             cv2.imwrite(os.path.join(debug_dir, f'final_{v}.png'), im)
-        self.calib_views = views
-        self.publish_views('calib', views, header)
-        self.publish_debug(views['overlay'], header)
+        if self.compact:
+            views = dict(views, overlay=self.overlay_for_publish(med, field, stage, title))
+        self.publish_calib(views, header)
 
         tf1 = core.cam_tf_from_pose(p, R_lo, t_lo)
         rows = core.segment_stats(field, stage['diag'])

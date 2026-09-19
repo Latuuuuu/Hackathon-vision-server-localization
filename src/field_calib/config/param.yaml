@@ -37,6 +37,8 @@ field_calib_node:
       band: 12.0
       warn_rms_px: 1.5
       warn_inlier_ratio: 0.7
+      compact: false                 # true: camera-size overlays + ~/{live,calib}/overlay/compressed (JPEG)
+      jpeg_quality: 80
     depth:
       enable: true
       frames: 10

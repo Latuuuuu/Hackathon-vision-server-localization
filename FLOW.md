@@ -205,6 +205,8 @@ flowchart TD
 
 ```bash
 ros2 launch field_calib field_calib.launch.py   # debug 畫面：/field_calib_node/debug/image（看法見 DEBUG.md）
+#   給 App 的高頻串流：live.compact:=true live.period:=0.1
+#   → ~/live/overlay 換成相機原圖尺寸，並多發 ~/{live,calib}/overlay/compressed（JPEG）
 ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger   # 也可以用 service 觸發
 # 其他影像 topic：/field_calib_node/live/overlay、/field_calib_node/calib/{overlay,strips,residuals}
 ```
@@ -214,6 +216,7 @@ ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger   # 也可以
 - **calibrate**：收 `calib.frames` 幀 → 完整校正，每一輪 band 都發布到 `~/calib/*`（每輪停 `calib.stage_delay` 秒），PNG 與 `cam_tf.yaml` 存到 `calib.output_dir/<時間>/`。
 - 校正通過就重新發布 `map→camera_link` 並寫入結果檔；`pnp_duck` / `homography_duck` 約 1 秒內跟上（`camera_pose_refresh_s`），不用重啟。
 - `calib.apply:=false` 為 dry run：只計算，不動 TF 與結果檔。
+- `live.compact`：疊圖只畫相機原圖（不含右側面板）並加發 JPEG。完整版 1740×820 每張 4.2 MB，BEST_EFFORT 訂閱者收不到；JPEG 約 106–144 KB，實測 10 Hz 穩定。寫檔的 PNG 仍是完整版。
 - 深度平面檢查：用 depth 擬合桌面平面，回報與桌緣解的法向量夾角、相機高度差（只回報，不進優化）。
 
 ### 離線

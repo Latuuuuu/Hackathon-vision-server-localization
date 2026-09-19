@@ -22,6 +22,8 @@ LAUNCH_DEFAULTS = {
     'calib.stage_delay': 1.0,
     'live.enable': True,
     'live.period': 1.0,
+    'live.compact': False,
+    'live.jpeg_quality': 80,
     'depth.enable': True,
     'calib.apply': True,
     'calib.on_startup': 'if_missing',
