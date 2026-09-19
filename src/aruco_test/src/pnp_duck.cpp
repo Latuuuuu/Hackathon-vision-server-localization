@@ -20,10 +20,12 @@
 
 // Localize a single robot by solving PnP on its marker, then transforming the pose into the world frame
 // with the static camera TF (world -> camera).
-// Two estimates are published:
+// Published estimates:
 //   pose_topic          : free 6-DoF PnP (IPPE_SQUARE), z is estimated
 //   plane_lm.pose_topic : PnP result moved along its viewing ray onto z = target_height, then refined by
 //                         3-DoF (x, y, yaw) LM on image reprojection error with the tag kept level
+//   final_pose_topic    : the final localization output (/pose/global): plane LM result, raw PnP when the
+//                         LM is disabled or not available for this frame
 class PnpDuckNode : public rclcpp::Node {
 public:
     PnpDuckNode() : Node("pnp_duck_node") {
@@ -35,6 +37,7 @@ public:
         this->declare_parameter<double>("target_height", 0.2);
         this->declare_parameter<bool>("plane_lm.enable", true);
         this->declare_parameter<std::string>("plane_lm.pose_topic", "/pose/global/pnp_plane_lm");
+        this->declare_parameter<std::string>("final_pose_topic", "/pose/global");
         this->declare_parameter<int>("plane_lm.max_iter", 15);
         this->declare_parameter<std::string>("world_frame", "map");
         this->declare_parameter<std::string>("camera_frame", "camera_color_optical_frame");
@@ -53,6 +56,7 @@ public:
         target_height_ = this->get_parameter("target_height").as_double();
         plane_lm_enable_ = this->get_parameter("plane_lm.enable").as_bool();
         plane_lm_pose_topic_ = this->get_parameter("plane_lm.pose_topic").as_string();
+        final_pose_topic_ = this->get_parameter("final_pose_topic").as_string();
         plane_lm_max_iter_ = this->get_parameter("plane_lm.max_iter").as_int();
         world_frame_ = this->get_parameter("world_frame").as_string();
         camera_frame_ = this->get_parameter("camera_frame").as_string();
@@ -89,6 +93,9 @@ public:
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(pose_topic_, 10);
         if (plane_lm_enable_) {
             plane_lm_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(plane_lm_pose_topic_, 10);
+        }
+        if (!final_pose_topic_.empty()) {
+            final_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(final_pose_topic_, 10);
         }
 
         // TODO: compare DICT_4X4_100 / APRILTAG_36h11 / APRILTAG_16h5 accuracy (see TODO.md)
@@ -404,6 +411,11 @@ private:
                     plane_lm_pose_pub_->publish(lm_pose_msg);
                     is_lm_valid = true;
                 }
+
+                // Final localization output
+                if (final_pose_pub_) {
+                    final_pose_pub_->publish(is_lm_valid ? lm_pose_msg : pose_msg);
+                }
             }
         }
 
@@ -485,6 +497,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_subscriber_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr plane_lm_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr final_pose_pub_;
+    std::string final_pose_topic_;
     std::string RGB_topic_;
     std::string camera_info_topic_;
     std::string pose_topic_;

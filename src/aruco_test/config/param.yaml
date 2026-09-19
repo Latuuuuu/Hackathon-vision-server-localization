@@ -38,6 +38,7 @@ homography_duck_node:
 pnp_duck_node:
   ros__parameters:
     pose_topic: /pose/global/pnp
+    final_pose_topic: /pose/global     # final output: plane LM (raw PnP fallback); '' = off
     plane_lm:
       enable: true
       pose_topic: /pose/global/pnp_plane_lm

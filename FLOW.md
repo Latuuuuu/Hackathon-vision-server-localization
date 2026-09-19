@@ -5,7 +5,7 @@
 | 節點 | 方法 | 輸出 |
 |---|---|---|
 | `homography_duck_node` | tag 固定在已知高度的水平面上（3 DoF：x, y, yaw） | `/pose/global/homography`（閉式解）、`/duck/pose/plane_lm`（LM refine） |
-| `pnp_duck_node` | solvePnP 自由 6 DoF，再轉到 map；再以 PnP 為初值做平面約束 LM | `/pose/global/pnp`（原始 PnP）、`/pose/global/pnp_plane_lm`（LM refine） |
+| `pnp_duck_node` | solvePnP 自由 6 DoF，再轉到 map；再以 PnP 為初值做平面約束 LM | **`/pose/global`（最終定位輸出 = LM refine，LM 不可用時退回原始 PnP）**、`/pose/global/pnp`（原始 PnP）、`/pose/global/pnp_plane_lm`（LM refine） |
 
 ---
 
@@ -36,6 +36,7 @@ flowchart LR
     HD -- "/duck/pose/plane_lm" --> OUT
     PD["pnp_duck_node"] -- "/pose/global/pnp" --> OUT
     PD -- "/pose/global/pnp_plane_lm" --> OUT
+    PD == "/pose/global（最終輸出）" ==> OUT
     HD -. "debug: TF homo_duck_1 / plane_lm_duck_1" .-> TF
     PD -. "debug: TF pnp_duck_1 / pnp_plane_lm_duck_1" .-> TF
 ```
@@ -112,6 +113,8 @@ flowchart TD
     RAY --> LM["3-DoF LM refine (x, y, yaw)<br/>殘差 = projectPoints(含畸變) − raw corners<br/>tag 限制在 z=h 水平面（共用 plane_lm.hpp）"]
     LM --> F2["pose_filter（EMA，獨立 state）"]
     F2 --> P2[/"plane_lm.pose_topic<br/>z 固定 = target_height"/]
+    P2 --> PF[/"final_pose_topic = /pose/global<br/>（LM 不可用時改發原始 PnP）"/]
+    P1 -. "LM 不可用時" .-> PF
 
     P1 --> DBG
     P2 --> DBG

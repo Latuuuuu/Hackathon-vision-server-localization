@@ -26,6 +26,7 @@ LAUNCH_DEFAULTS = {
     'camera_pose_refresh_s': 1.0,
     'plane_lm.enable': True,
     'plane_lm.pose_topic': '/pose/global/pnp_plane_lm',
+    'final_pose_topic': '/pose/global',
     'plane_lm.max_iter': 15,
     'pose_filter.enable': False,
     'pose_filter.alpha': 0.1,
