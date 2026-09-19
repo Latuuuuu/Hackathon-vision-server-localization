@@ -15,16 +15,25 @@
 #include <algorithm>
 #include <cmath>
 
-// Localize a single robot with a ground-plane homography.
+#include "aruco_test/plane_lm.hpp"
+
+// Localize a single robot whose tag lies on a known level plane z = target_height.
 // No field markers: H is derived from the static camera TF (world -> camera) and camera intrinsics.
+// Two estimates are published:
+//   pose_topic          : 4 corners ray-cast onto z = target_height, then 2D rigid fit (closed form)
+//   plane_lm.pose_topic : the above refined by 3-DoF (x, y, yaw) LM on image reprojection error
 class HomographyDuckNode : public rclcpp::Node {
 public:
     HomographyDuckNode() : Node("homography_duck_node") {
         this->declare_parameter<std::string>("RGB_topic", "/camera/camera/color/image_raw");
         this->declare_parameter<std::string>("camera_info_topic", "/camera/camera/color/camera_info");
         this->declare_parameter<std::string>("pose_topic", "/duck/pose/homography");
-        this->declare_parameter<double>("target_height", 0.447);
+        this->declare_parameter<double>("target_height", 0.2);
         this->declare_parameter<int>("robot.id", 1);
+        this->declare_parameter<double>("robot.marker_size", 0.1);
+        this->declare_parameter<bool>("plane_lm.enable", true);
+        this->declare_parameter<std::string>("plane_lm.pose_topic", "/duck/pose/plane_lm");
+        this->declare_parameter<int>("plane_lm.max_iter", 15);
         this->declare_parameter<std::string>("world_frame", "map");
         this->declare_parameter<std::string>("camera_frame", "camera_color_optical_frame");
         this->declare_parameter<bool>("pose_filter.enable", false);
@@ -37,6 +46,10 @@ public:
         pose_topic_ = this->get_parameter("pose_topic").as_string();
         target_height_ = this->get_parameter("target_height").as_double();
         robot_id_ = this->get_parameter("robot.id").as_int();
+        marker_size_ = this->get_parameter("robot.marker_size").as_double();
+        plane_lm_enable_ = this->get_parameter("plane_lm.enable").as_bool();
+        plane_lm_pose_topic_ = this->get_parameter("plane_lm.pose_topic").as_string();
+        plane_lm_max_iter_ = this->get_parameter("plane_lm.max_iter").as_int();
         world_frame_ = this->get_parameter("world_frame").as_string();
         camera_frame_ = this->get_parameter("camera_frame").as_string();
         pose_filter_enable_ = this->get_parameter("pose_filter.enable").as_bool();
@@ -58,6 +71,9 @@ public:
             std::bind(&HomographyDuckNode::RGB_img_callback, this, std::placeholders::_1));
 
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(pose_topic_, 10);
+        if (plane_lm_enable_) {
+            plane_lm_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(plane_lm_pose_topic_, 10);
+        }
 
         // TODO: compare DICT_4X4_100 / APRILTAG_36h11 / APRILTAG_16h5 accuracy (see TODO.md)
         dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_APRILTAG_16h5);
@@ -67,16 +83,32 @@ public:
         detector_params_->adaptiveThreshWinSizeMin = 3;
         detector_params_->adaptiveThreshWinSizeMax = 23;
         detector_params_->adaptiveThreshWinSizeStep = 10;
+
+        // Marker corners in marker frame (z up), same order as detectMarkers output:
+        // top-left, top-right, bottom-right, bottom-left
+        const double h = marker_size_ / 2.0;
+        marker_obj_points_ = {
+            cv::Point2d(-h,  h),
+            cv::Point2d( h,  h),
+            cv::Point2d( h, -h),
+            cv::Point2d(-h, -h)
+        };
     }
 
 private:
-    void pose_filter(const double raw_pose[3], double filtered_pose[3]) {
+    // Separate EMA state per published estimate
+    struct PoseFilterState {
+        bool initialized = false;
+        double pose[3] = {0.0, 0.0, 0.0};
+    };
+
+    void pose_filter(PoseFilterState &state, const double raw_pose[3], double filtered_pose[3]) {
         filtered_pose[0] = raw_pose[0];
         filtered_pose[1] = raw_pose[1];
         filtered_pose[2] = raw_pose[2];
 
         if (!pose_filter_enable_) {
-            pose_filter_initialized_ = false;
+            state.initialized = false;
             return;
         }
 
@@ -85,32 +117,32 @@ private:
         pose_filter_max_jump_m_ = this->get_parameter("pose_filter.max_jump_m").as_double();
         const double alpha = std::clamp(pose_filter_alpha_, 0.0, 1.0);
 
-        if (!pose_filter_initialized_) {
-            pose_filtered_[0] = raw_pose[0];
-            pose_filtered_[1] = raw_pose[1];
-            pose_filtered_[2] = raw_pose[2];
-            pose_filter_initialized_ = true;
+        if (!state.initialized) {
+            state.pose[0] = raw_pose[0];
+            state.pose[1] = raw_pose[1];
+            state.pose[2] = raw_pose[2];
+            state.initialized = true;
         } else {
-            const double dx = raw_pose[0] - pose_filtered_[0];
-            const double dy = raw_pose[1] - pose_filtered_[1];
-            const double dz = raw_pose[2] - pose_filtered_[2];
+            const double dx = raw_pose[0] - state.pose[0];
+            const double dy = raw_pose[1] - state.pose[1];
+            const double dz = raw_pose[2] - state.pose[2];
             const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 
             if (pose_filter_max_jump_m_ > 0.0 && dist > pose_filter_max_jump_m_) {
                 // outlier guard: snap to measurement on big jumps
-                pose_filtered_[0] = raw_pose[0];
-                pose_filtered_[1] = raw_pose[1];
-                pose_filtered_[2] = raw_pose[2];
+                state.pose[0] = raw_pose[0];
+                state.pose[1] = raw_pose[1];
+                state.pose[2] = raw_pose[2];
             } else {
-                pose_filtered_[0] = alpha * raw_pose[0] + (1.0 - alpha) * pose_filtered_[0];
-                pose_filtered_[1] = alpha * raw_pose[1] + (1.0 - alpha) * pose_filtered_[1];
-                pose_filtered_[2] = alpha * raw_pose[2] + (1.0 - alpha) * pose_filtered_[2];
+                state.pose[0] = alpha * raw_pose[0] + (1.0 - alpha) * state.pose[0];
+                state.pose[1] = alpha * raw_pose[1] + (1.0 - alpha) * state.pose[1];
+                state.pose[2] = alpha * raw_pose[2] + (1.0 - alpha) * state.pose[2];
             }
         }
 
-        filtered_pose[0] = pose_filtered_[0];
-        filtered_pose[1] = pose_filtered_[1];
-        filtered_pose[2] = pose_filtered_[2];
+        filtered_pose[0] = state.pose[0];
+        filtered_pose[1] = state.pose[1];
+        filtered_pose[2] = state.pose[2];
     }
 
     void camera_info_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
@@ -158,6 +190,16 @@ private:
             H_ = H_world_to_img_.inv();
             H_ /= H_.at<double>(2, 2);
 
+            // Full world -> camera pose for cv::projectPoints in plane LM
+            cv::Mat R_cw_cv = (cv::Mat_<double>(3, 3) <<
+                R_cw(0, 0), R_cw(0, 1), R_cw(0, 2),
+                R_cw(1, 0), R_cw(1, 1), R_cw(1, 2),
+                R_cw(2, 0), R_cw(2, 1), R_cw(2, 2));
+            lm_cam_.K = camera_matrix_;
+            lm_cam_.D = dist_coeffs_;
+            cv::Rodrigues(R_cw_cv, lm_cam_.rvec_cw);
+            lm_cam_.tvec_cw = (cv::Mat_<double>(3, 1) << t_cw(0), t_cw(1), t_cw(2));
+
             is_camera_position_initialized_ = true;
             RCLCPP_INFO(this->get_logger(), "Camera position: X=%.3f, Y=%.3f, Z=%.3f", cam_x_, cam_y_, cam_z_);
             RCLCPP_INFO(this->get_logger(), "Ground homography (image -> world):\n[%.6f, %.6f, %.6f]\n[%.6f, %.6f, %.6f]\n[%.6f, %.6f, %.6f]",
@@ -181,6 +223,70 @@ private:
         X = pt_dst.at<double>(0, 0) / w;
         Y = pt_dst.at<double>(1, 0) / w;
         return true;
+    }
+
+    // Intersect the ray through an undistorted pixel with the level plane z = target_height_:
+    // project to z=0 ground, then scale toward the camera center (similar triangles)
+    bool pixel_to_target_plane(const cv::Point2f &px, double &X, double &Y) const {
+        double X_g, Y_g;
+        if (!pixel_to_ground(px, X_g, Y_g)) {
+            return false;
+        }
+        const double t = (cam_z_ - target_height_) / cam_z_;
+        X = cam_x_ + t * (X_g - cam_x_);
+        Y = cam_y_ + t * (Y_g - cam_y_);
+        return true;
+    }
+
+    // Closed-form (x, y, yaw): ray-cast all 4 undistorted corners onto the target plane,
+    // then least-squares 2D rigid fit of the marker square (Procrustes, no scale).
+    // For a square the fitted center is the corner centroid, so marker size is not needed.
+    bool estimate_plane_rigid(const std::vector<cv::Point2f> &undist_corners, double pose[3]) const {
+        cv::Point2d dst[4];
+        cv::Point2d dst_mean(0.0, 0.0);
+        for (int i = 0; i < 4; i++) {
+            if (!pixel_to_target_plane(undist_corners[i], dst[i].x, dst[i].y)) {
+                return false;
+            }
+            dst_mean += dst[i] * 0.25;
+        }
+        double s_cross = 0.0, s_dot = 0.0;
+        for (int i = 0; i < 4; i++) {
+            const cv::Point2d &a = marker_obj_points_[i];  // already centered
+            const cv::Point2d b = dst[i] - dst_mean;
+            s_cross += a.x * b.y - a.y * b.x;
+            s_dot += a.x * b.x + a.y * b.y;
+        }
+        pose[0] = dst_mean.x;
+        pose[1] = dst_mean.y;
+        pose[2] = std::atan2(s_cross, s_dot);
+        return true;
+    }
+
+    geometry_msgs::msg::PoseStamped make_pose_msg(const std_msgs::msg::Header &header, const double pos[3], double yaw) const {
+        geometry_msgs::msg::PoseStamped pose_msg;
+        pose_msg.header.stamp = header.stamp;
+        pose_msg.header.frame_id = world_frame_;
+        pose_msg.pose.position.x = pos[0];
+        pose_msg.pose.position.y = pos[1];
+        pose_msg.pose.position.z = pos[2];
+        // roll = pitch = 0, yaw = yaw
+        pose_msg.pose.orientation.x = 0.0;
+        pose_msg.pose.orientation.y = 0.0;
+        pose_msg.pose.orientation.z = std::sin(yaw * 0.5);
+        pose_msg.pose.orientation.w = std::cos(yaw * 0.5);
+        return pose_msg;
+    }
+
+    void broadcast_debug_tf(const geometry_msgs::msg::PoseStamped &pose_msg, const std::string &child_frame) {
+        geometry_msgs::msg::TransformStamped t;
+        t.header = pose_msg.header;
+        t.child_frame_id = child_frame;
+        t.transform.translation.x = pose_msg.pose.position.x;
+        t.transform.translation.y = pose_msg.pose.position.y;
+        t.transform.translation.z = pose_msg.pose.position.z;
+        t.transform.rotation = pose_msg.pose.orientation;
+        tf_broadcaster_->sendTransform(t);
     }
 
     // Draw world origin and 1 m X/Y axes projected on the ground, for checking extrinsics by eye
@@ -228,65 +334,51 @@ private:
         std::vector<std::vector<cv::Point2f>> marker_corners, rejected_candidates;
         cv::aruco::detectMarkers(RGB_frame, dictionary_, marker_corners, marker_ids, detector_params_, rejected_candidates);
 
-        std::vector<cv::Point2f> target_corners;
+        std::vector<cv::Point2f> raw_corners, target_corners;
         bool is_target_found = false;
         for (size_t i = 0; i < marker_ids.size(); i++) {
             if (marker_ids[i] == robot_id_) {
+                raw_corners = marker_corners[i];
                 // H is built for an ideal pinhole camera, so remove lens distortion first
-                cv::undistortPoints(marker_corners[i], target_corners, camera_matrix_, dist_coeffs_, cv::noArray(), camera_matrix_);
+                cv::undistortPoints(raw_corners, target_corners, camera_matrix_, dist_coeffs_, cv::noArray(), camera_matrix_);
                 is_target_found = true;
                 break;
             }
         }
 
-        double raw_pose[3] = {0.0, 0.0, 0.0};
+        double raw_pose[3] = {0.0, 0.0, target_height_};
         double final_pose[3] = {0.0, 0.0, 0.0};
         double yaw_rad = 0.0;
-        double yaw_deg = 0.0;
-        cv::Point2f target_center(0.0f, 0.0f);
+        double lm_raw_pose[3] = {0.0, 0.0, target_height_};
+        double lm_final_pose[3] = {0.0, 0.0, 0.0};
+        double lm_yaw_rad = 0.0;
+        double lm_rms = 0.0;
         bool is_pose_valid = false;
+        bool is_lm_valid = false;
+        geometry_msgs::msg::PoseStamped pose_msg, lm_pose_msg;
 
         if (is_target_found && target_corners.size() == 4) {
-            // tl, tr, br, bl
-            const cv::Point2f &tl = target_corners[0];
-            const cv::Point2f &tr = target_corners[1];
-            const cv::Point2f &br = target_corners[2];
-            const cv::Point2f &bl = target_corners[3];
-            target_center = (tl + br) * 0.5f;
-
-            double X_g, Y_g, X_left, Y_left, X_right, Y_right;
-            if (pixel_to_ground(target_center, X_g, Y_g) &&
-                pixel_to_ground((bl + tl) * 0.5f, X_left, Y_left) &&
-                pixel_to_ground((br + tr) * 0.5f, X_right, Y_right)) {
-                // project target pixel to Z=0 ground to get shadow, then
-                // use 3D similar triangle linear interpolation to get Z=target_height_ coordinates
-                const double t = (cam_z_ - target_height_) / cam_z_;
-                raw_pose[0] = cam_x_ + t * (X_g - cam_x_);
-                raw_pose[1] = cam_y_ + t * (Y_g - cam_y_);
-                raw_pose[2] = target_height_;
-                pose_filter(raw_pose, final_pose);
-
-                // yaw from marker left -> right direction on the ground
-                // (scaling about the camera center keeps the direction, so no height correction needed)
-                yaw_rad = std::atan2(Y_right - Y_left, X_right - X_left);
-                yaw_deg = yaw_rad * 180.0 / CV_PI;
-
-                geometry_msgs::msg::PoseStamped pose_msg;
-                pose_msg.header.stamp = msg->header.stamp;
-                pose_msg.header.frame_id = world_frame_;
-                pose_msg.pose.position.x = final_pose[0];
-                pose_msg.pose.position.y = final_pose[1];
-                pose_msg.pose.position.z = final_pose[2];
-
-                // roll = pitch = 0, yaw = yaw_rad
-                const double half_yaw = yaw_rad * 0.5;
-                pose_msg.pose.orientation.x = 0.0;
-                pose_msg.pose.orientation.y = 0.0;
-                pose_msg.pose.orientation.z = std::sin(half_yaw);
-                pose_msg.pose.orientation.w = std::cos(half_yaw);
-
+            double plane_pose[3];  // x, y, yaw
+            if (estimate_plane_rigid(target_corners, plane_pose)) {
+                raw_pose[0] = plane_pose[0];
+                raw_pose[1] = plane_pose[1];
+                yaw_rad = plane_pose[2];
+                pose_filter(pose_filter_state_, raw_pose, final_pose);
+                pose_msg = make_pose_msg(msg->header, final_pose, yaw_rad);
                 pose_pub_->publish(pose_msg);
                 is_pose_valid = true;
+
+                if (plane_lm_enable_) {
+                    lm_rms = aruco_test::refine_plane_lm(raw_corners, marker_obj_points_, target_height_, lm_cam_,
+                                                         plane_lm_max_iter_, plane_pose);
+                    lm_raw_pose[0] = plane_pose[0];
+                    lm_raw_pose[1] = plane_pose[1];
+                    lm_yaw_rad = plane_pose[2];
+                    pose_filter(lm_pose_filter_state_, lm_raw_pose, lm_final_pose);
+                    lm_pose_msg = make_pose_msg(msg->header, lm_final_pose, lm_yaw_rad);
+                    plane_lm_pose_pub_->publish(lm_pose_msg);
+                    is_lm_valid = true;
+                }
             }
         }
 
@@ -296,25 +388,19 @@ private:
         if (is_debug_mode_) {
             if (is_pose_valid) {
                 RCLCPP_INFO(this->get_logger(),
-                    "Target 3D raw:(%.3f, %.3f, %.3f) filtered:(%.3f, %.3f, %.3f), Yaw: %.3f rad %.3f deg",
+                    "Rigid raw:(%.3f, %.3f, %.3f) filtered:(%.3f, %.3f, %.3f), Yaw: %.3f rad %.3f deg",
                     raw_pose[0], raw_pose[1], raw_pose[2],
                     final_pose[0], final_pose[1], final_pose[2],
-                    yaw_rad, yaw_deg
-                );
-                // broadcast TF for debugging
-                geometry_msgs::msg::TransformStamped t;
-                t.header.stamp = msg->header.stamp;
-                t.header.frame_id = world_frame_;
-                t.child_frame_id = "homo_duck_" + std::to_string(robot_id_);
-                t.transform.translation.x = final_pose[0];
-                t.transform.translation.y = final_pose[1];
-                t.transform.translation.z = final_pose[2];
-                const double half_yaw = yaw_rad * 0.5;
-                t.transform.rotation.x = 0.0;
-                t.transform.rotation.y = 0.0;
-                t.transform.rotation.z = std::sin(half_yaw);
-                t.transform.rotation.w = std::cos(half_yaw);
-                tf_broadcaster_->sendTransform(t);
+                    yaw_rad, yaw_rad * 180.0 / CV_PI);
+                broadcast_debug_tf(pose_msg, "homo_duck_" + std::to_string(robot_id_));
+            }
+            if (is_lm_valid) {
+                RCLCPP_INFO(this->get_logger(),
+                    "PlaneLM raw:(%.3f, %.3f, %.3f) filtered:(%.3f, %.3f, %.3f), Yaw: %.3f rad %.3f deg, reproj RMS: %.3f px",
+                    lm_raw_pose[0], lm_raw_pose[1], lm_raw_pose[2],
+                    lm_final_pose[0], lm_final_pose[1], lm_final_pose[2],
+                    lm_yaw_rad, lm_yaw_rad * 180.0 / CV_PI, lm_rms);
+                broadcast_debug_tf(lm_pose_msg, "plane_lm_duck_" + std::to_string(robot_id_));
             }
 
             if (image_debug_) {
@@ -326,9 +412,15 @@ private:
                     cv::aruco::drawDetectedMarkers(RGB_frame, rejected_candidates, cv::noArray(), cv::Scalar(255, 0, 255));
                 }
                 draw_world_axes(RGB_frame);
-                // draw a red point on the target center (undistorted pixel)
-                if (is_target_found) {
-                    cv::circle(RGB_frame, target_center, 5, cv::Scalar(0, 0, 255), -1);
+                // draw plane-LM fitted corners (yellow) to check the fit against the detection
+                if (is_lm_valid) {
+                    Eigen::Matrix<double, 8, 1> r;
+                    const Eigen::Vector3d p(lm_raw_pose[0], lm_raw_pose[1], lm_yaw_rad);
+                    aruco_test::plane_residual(p, raw_corners, marker_obj_points_, target_height_, lm_cam_, r);
+                    for (int i = 0; i < 4; i++) {
+                        const cv::Point2f fitted(raw_corners[i].x + r(2 * i), raw_corners[i].y + r(2 * i + 1));
+                        cv::circle(RGB_frame, fitted, 3, cv::Scalar(0, 255, 255), -1);
+                    }
                 }
                 cv::imshow("Homography Duck", RGB_frame);
                 cv::waitKey(1);
@@ -357,6 +449,14 @@ private:
     double target_height_;
 
     int robot_id_ = 1;
+    double marker_size_ = 0.1;
+    std::vector<cv::Point2d> marker_obj_points_;  // marker frame, tl, tr, br, bl
+
+    bool plane_lm_enable_ = true;
+    int plane_lm_max_iter_ = 15;
+    std::string plane_lm_pose_topic_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr plane_lm_pose_pub_;
+    aruco_test::PlaneLmCamera lm_cam_;  // K, D, world -> camera pose for plane LM
 
     bool is_debug_mode_ = false;
     bool image_debug_ = false;
@@ -364,10 +464,10 @@ private:
     bool is_camera_info_received_ = false;
     bool is_camera_position_initialized_ = false;
     bool pose_filter_enable_ = true;
-    bool pose_filter_initialized_ = false;
     double pose_filter_alpha_ = 0.2;
     double pose_filter_max_jump_m_ = 0.5;
-    double pose_filtered_[3] = {0.0, 0.0, 0.0};
+    PoseFilterState pose_filter_state_;
+    PoseFilterState lm_pose_filter_state_;
 
     cv::Ptr<cv::aruco::Dictionary> dictionary_;
     cv::Ptr<cv::aruco::DetectorParameters> detector_params_;

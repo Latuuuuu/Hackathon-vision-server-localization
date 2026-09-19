@@ -1,0 +1,42 @@
+# Parameters for homography_duck_node and pnp_duck_node.
+# Precedence (high -> low): command line > this file > launch-file defaults > C++ defaults
+# The camera extrinsic (map -> camera_link) is not here: it is published by
+# realsense2_camera/launch/rs_launch.py (cam_tf.* arguments).
+
+# Shared by both localization nodes
+/**:
+  ros__parameters:
+    RGB_topic: /camera/camera/color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    world_frame: map
+    camera_frame: camera_color_optical_frame
+    target_height: 0.2     # tag surface height above map z=0 (m), used by plane LM in both nodes
+
+    robot:
+      id: 1                # DICT_APRILTAG_16h5
+      marker_size: 0.08     # black-border edge length (m), white margin excluded
+
+    pose_filter:
+      enable: false
+      alpha: 0.1
+      max_jump_m: 0.15
+
+    debug:
+      enable: true
+      img: true
+
+homography_duck_node:
+  ros__parameters:
+    pose_topic: /pose/global/homography
+    plane_lm:
+      enable: true
+      pose_topic: /duck/pose/plane_lm
+      max_iter: 15
+
+pnp_duck_node:
+  ros__parameters:
+    pose_topic: /pose/global/pnp
+    plane_lm:
+      enable: true
+      pose_topic: /pose/global/pnp_plane_lm
+      max_iter: 15
