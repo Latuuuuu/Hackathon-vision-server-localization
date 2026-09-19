@@ -24,6 +24,7 @@ field_calib_node:
       frames: 30
       bands: [80.0, 40.0, 20.0, 12.0]
       stage_delay: 1.0               # pause after publishing each band's debug images (s)
+      hold_s: 15.0                   # ~/debug/image shows the result this long, then the live view
       output_dir: /home/vision/vision_ws/tools/calib/out/ros
       result_file: ''                # '' = <output_dir>/cam_tf.yaml (loaded + published at startup)
       on_startup: if_missing         # if_missing / always / never
@@ -39,8 +40,6 @@ field_calib_node:
     depth:
       enable: true
       frames: 10
-    debug:
-      window: true                   # OpenCV overlay window (c = calibrate, l = back to live)
     tag:
       id: 1
       size: 0.08

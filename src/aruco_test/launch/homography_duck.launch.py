@@ -32,6 +32,7 @@ LAUNCH_DEFAULTS = {
     'pose_filter.max_jump_m': 0.15,
     'debug.enable': True,
     'debug.img': True,
+    'debug.img_topic': '~/debug/image',
 }
 
 ARGUMENTS = [

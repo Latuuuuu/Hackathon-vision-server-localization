@@ -31,6 +31,7 @@ public:
         this->declare_parameter<double>("pose_filter.max_jump_m", 0.15);
         this->declare_parameter<bool>("debug.enable", false);
         this->declare_parameter<bool>("debug.img", false);
+        this->declare_parameter<std::string>("debug.img_topic", "~/debug/image");
         RGB_topic_ = this->get_parameter("RGB_topic").as_string();
         target_height_ = this->get_parameter("target_height").as_double();
         marker_size_ = this->get_parameter("marker_size").as_double();
@@ -44,6 +45,11 @@ public:
         pose_filter_max_jump_m_ = this->get_parameter("pose_filter.max_jump_m").as_double();
         is_debug_mode_ = this->get_parameter("debug.enable").as_bool();
         image_debug_ = this->get_parameter("debug.img").as_bool();
+        if (image_debug_) {
+            // Debug image as a topic (view with rqt_image_view / RViz) instead of an OpenCV window
+            debug_img_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+                this->get_parameter("debug.img_topic").as_string(), 1);
+        }
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -137,6 +143,12 @@ private:
             return;
         }
     }
+    void publish_debug_image(const cv::Mat &bgr, const std_msgs::msg::Header &header) {
+        if (debug_img_pub_) {
+            debug_img_pub_->publish(*cv_bridge::CvImage(header, "bgr8", bgr).toImageMsg());
+        }
+    }
+
     void RGB_img_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
         try {
 
@@ -339,8 +351,7 @@ private:
                         // draw a red point on the target center (pixel)
                         cv::circle(RGB_frame, cv::Point(target_u, target_v), 5, cv::Scalar(0, 0, 255), -1);
 
-                        cv::imshow("Homography C++", RGB_frame);
-                        cv::waitKey(1);
+                        publish_debug_image(RGB_frame, msg->header);
                     }
 
                     if(is_target_found){
@@ -397,6 +408,7 @@ private:
 
     bool is_debug_mode_ = false;
     bool image_debug_ = false;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_img_pub_;
 
     bool is_camera_position_initialized_ = false;
     bool pose_filter_enable_ = true;

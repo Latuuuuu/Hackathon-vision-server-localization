@@ -24,7 +24,8 @@
 
     debug:
       enable: true
-      img: true
+      img: true              # publish the debug image (no OpenCV window)
+      img_topic: '~/debug/image' # e.g. /pnp_duck_node/debug/image
 
 homography_duck_node:
   ros__parameters:

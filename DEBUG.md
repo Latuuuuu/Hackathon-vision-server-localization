@@ -18,7 +18,7 @@ table:
   count: 2      # 沿短邊併排的桌子張數
 ```
 
-- 節點**每次校正都會重新讀這個檔**，改完直接按 `c` 或呼叫 service 即可，不用重啟。
+- 節點**每次校正都會重新讀這個檔**，改完直接呼叫 `~/calibrate` service 即可，不用重啟。
 - 之後的網頁只要寫入同樣內容，再觸發校正。
 
 ### 1.2 啟動
@@ -27,8 +27,19 @@ table:
 # container，~/vision_ws
 colcon build --packages-select field_calib aruco_test realsense2_camera && source install/setup.bash
 ros2 launch realsense2_camera rs_launch.py        # cam_tf.enable 預設已改為 false
-ros2 launch field_calib field_calib.launch.py     # 開 overlay 視窗，並負責發布 map → camera_link
+ros2 launch field_calib field_calib.launch.py     # 負責發布 map → camera_link
 ```
+
+debug 畫面一律用 image topic 發布（不開 OpenCV 視窗），用 `rqt_image_view` 或 RViz 的 Image display 看：
+
+| topic | 內容 |
+|---|---|
+| `/field_calib_node/debug/image` | **主要看這個**：平常是 live overlay；校正時逐輪顯示，完成後停在結果 `calib.hold_s` 秒（預設 15）再回到 live |
+| `/field_calib_node/live/overlay` | 只有 live overlay |
+| `/field_calib_node/calib/{overlay,strips,residuals}` | 最近一次校正（每輪都會更新） |
+| `/pnp_duck_node/debug/image`、`/homography_duck_node/debug/image` | 定位節點的 debug 畫面（`debug.img:=true` 時才發布，topic 可用 `debug.img_topic` 改） |
+
+容器目前沒有 `rqt_image_view`，要用的話先安裝 `ros-humble-rqt-image-view`，或在 RViz 加 Image display。
 
 啟動時：
 
@@ -40,8 +51,7 @@ ros2 launch field_calib field_calib.launch.py     # 開 overlay 視窗，並負�
 
 ### 1.3 重新校正
 
-- overlay 視窗按 `c`，或 `ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger`。
-- 按 `l` 回到 live 畫面。
+- `ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger`，在 `/field_calib_node/debug/image` 看過程與結果。
 - 相機被移動也可以直接校正：初值同時來自
   - **深度**：擬合桌面平面，再用長方形擬合桌面範圍（不需要舊外參）；
   - **目前的 TF**。
@@ -65,7 +75,7 @@ ros2 launch field_calib field_calib.launch.py     # 開 overlay 視窗，並負�
 | 畫面 | 何時 | 用的位姿 | 用途 |
 |---|---|---|---|
 | **live**（標題 `live`） | 平常，每 1 秒更新 | 目前 TF（本節點發布的外參） | 檢查**目前使用中的外參**對不對；相機被碰、桌子被推會立刻看出來 |
-| **calib**（標題 `calib`） | 按 `c` 之後 | 每一輪優化前 / 後 | 看校正過程中每條邊抓到哪裡、哪些點被丟掉 |
+| **calib**（標題 `calib`） | 呼叫 `~/calibrate` 之後 | 每一輪優化前 / 後 | 看校正過程中每條邊抓到哪裡、哪些點被丟掉 |
 
 live 模式對不上時，terminal 會出現：
 
@@ -77,7 +87,7 @@ table edges do not match the current extrinsic: inlier RMS 2.6 px, accepted 22% 
 
 ---
 
-## 3. overlay 視窗怎麼看
+## 3. overlay 畫面怎麼看
 
 左邊是相機影像，右邊是資訊面板。
 
@@ -121,8 +131,8 @@ table edges do not match the current extrinsic: inlier RMS 2.6 px, accepted 22% 
 
 | 症狀 | 可能原因 | 怎麼確認 / 處理 |
 |---|---|---|
-| live 畫面整個模型框**歪斜、扭轉**，warning 一直出現 | 相機或桌子被移動過，外參已過時；或另有節點在發布 `map → camera_link`（例如手動開了 `cam_tf.enable:=true`） | 看啟動時有沒有「already published by another node」警告；按 `c` 重新校正 |
-| live 突然從正常變成對不上 | 相機被碰到、桌子被推動 | 按 `c` 重新校正；通過後 TF 自動更新，定位節點約 1 秒內跟上 |
+| live 畫面整個模型框**歪斜、扭轉**，warning 一直出現 | 相機或桌子被移動過，外參已過時；或另有節點在發布 `map → camera_link`（例如手動開了 `cam_tf.enable:=true`） | 看啟動時有沒有「already published by another node」警告；呼叫 `~/calibrate` 重新校正 |
+| live 突然從正常變成對不上 | 相機被碰到、桌子被推動 | 呼叫 `~/calibrate` 重新校正；通過後 TF 自動更新，定位節點約 1 秒內跟上 |
 | 某條邊幾乎全是 × 或 acc 很少 | 被人或物品擋住 | 清開後再校正；長期擋住的邊用 `field.disabled_segments:=right_1` 關掉 |
 | 某條邊有一段綠點整段偏 1–3 px | 抓到桌腳、線材、陰影、桌邊反光 | 看該輪的 `strips.png`（見第 5 節）確認抓到什麼；清開該區或關掉該邊 |
 | 第一輪（80 px）大量藍 × | 初值離真值太遠，或搜尋範圍內有更強的邊 | 看 terminal 的 `depth init` 是否成功（深度初值不依賴舊外參）；或加大 `calib.bands` 第一個值 |
@@ -179,7 +189,7 @@ python3 tools/calib/field_edge_calib.py --selftest     # 合成影像自我測�
 | `calib.min_accept_ratio` / `calib.max_rms_px` | 0.6 / 1.5 | 低於／高於門檻就不套用 |
 | `calib.apply` | true | false = dry run，不發布 TF、不寫結果檔 |
 | `live.band` / `live.period` | 12 / 1.0 | live 檢查的搜尋範圍與更新週期 |
-| `debug.window` | true | 是否開 overlay 視窗 |
+| `calib.hold_s` | 15.0 | 校正完成後 `~/debug/image` 停在結果畫面的秒數 |
 
 桌子尺寸、角落排除距離、接縫、各桌 x 偏移在 `src/field_calib/config/field.yaml`。
 定位節點的 `camera_pose_refresh_s`（預設 1.0 秒，0 = 關閉）在 `src/aruco_test/config/param.yaml`。

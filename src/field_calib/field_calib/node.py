@@ -1,5 +1,6 @@
 """field_calib_node: table-edge extrinsic calibration with live debug images.
 
+~/debug/image         : what to watch: live overlay, or the calibration stages / result (calib.hold_s)
 live (timer)          : edge search + residuals under the current TF (no optimization)
                         -> ~/live/overlay, warns when the edges drift (camera bumped)
 ~/calibrate (Trigger) : re-read the table size (field_file) -> median of N frames -> calibration from
@@ -88,7 +89,7 @@ class FieldCalibNode(Node):
         dp('tag.id', 1)
         dp('tag.size', 0.08)
         dp('tag.height', 0.2)
-        dp('debug.window', True)
+        dp('calib.hold_s', 15.0)  # ~/debug/image keeps showing the calibration result this long
 
         self.field = self.load_field()
 
@@ -105,8 +106,7 @@ class FieldCalibNode(Node):
         self.depth_frames = None
         self.calib_views = None
         self.live_views = None
-        self.show_calib = False  # windows show the calibration result instead of the live view
-        self.stop_display = False
+        self.show_calib_until = 0.0  # ~/debug/image shows the calibration result until this time
         self.busy = False
 
         sensors = MutuallyExclusiveCallbackGroup()
@@ -118,12 +118,11 @@ class FieldCalibNode(Node):
             self.create_subscription(Image, self.p('depth_topic'), self.on_depth, 10, callback_group=sensors)
         self.pubs = {f'{kind}/{v}': self.create_publisher(Image, f'~/{kind}/{v}', 1)
                      for kind, vs in (('live', ('overlay',)), ('calib', VIEWS)) for v in vs}
+        # What an operator watches: live overlay, or the calibration stages / result
+        self.debug_pub = self.create_publisher(Image, '~/debug/image', 1)
         self.create_service(Trigger, '~/calibrate', self.on_calibrate,
                             callback_group=MutuallyExclusiveCallbackGroup())
         self.create_timer(self.p('live.period'), self.on_timer, callback_group=MutuallyExclusiveCallbackGroup())
-        if self.p('debug.window'):
-            threading.Thread(target=self.display_loop, daemon=True).start()
-            self.get_logger().info('debug window: press c to calibrate, l to return to the live view')
         threading.Thread(target=self.startup, daemon=True).start()
         self.get_logger().info('ready: ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger')
 
@@ -246,6 +245,11 @@ class FieldCalibNode(Node):
             msg.header = header
             self.pubs[f'{kind}/{name}'].publish(msg)
 
+    def publish_debug(self, im, header):
+        msg = self.bridge.cv2_to_imgmsg(im, 'bgr8')
+        msg.header = header
+        self.debug_pub.publish(msg)
+
     def blurred(self, img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
         return cv2.GaussianBlur(gray, (0, 0), self.p('edge.blur'))
@@ -259,6 +263,8 @@ class FieldCalibNode(Node):
         img, header = latest
         if self.calib_views is not None:
             self.publish_views('calib', self.calib_views, header)  # keep the last result visible
+            if not busy and time.time() < self.show_calib_until:
+                self.publish_debug(self.calib_views['overlay'], header)
         if busy or not self.p('live.enable'):
             return
         field = self.field
@@ -275,6 +281,8 @@ class FieldCalibNode(Node):
         with self.lock:
             self.live_views = views
         self.publish_views('live', views, header)
+        if time.time() >= self.show_calib_until:
+            self.publish_debug(views['overlay'], header)
         d = stage['diag']
         considered = d['status'] != core.OUT_OF_IMAGE
         acc = d['status'] == core.ACCEPTED
@@ -315,7 +323,6 @@ class FieldCalibNode(Node):
             if self.busy:
                 return False, 'calibration already running'
             self.busy = True
-            self.show_calib = True
         try:
             return True, self.run_calibration()
         except Exception as e:  # noqa: BLE001
@@ -325,32 +332,7 @@ class FieldCalibNode(Node):
         finally:
             with self.lock:
                 self.busy = False
-
-    # ------------------------------------------------------------------ OpenCV windows
-    def display_loop(self):
-        """All HighGUI calls stay in this thread. Only the overlay is shown; strips / residuals are
-        saved as PNG during calibration. Keys: c = calibrate, l = back to the live view."""
-        name = 'field_calib'
-        sized = False
-        while rclpy.ok() and not self.stop_display:
-            with self.lock:
-                views = self.calib_views if (self.show_calib and self.calib_views) else self.live_views
-            if views:
-                im = views['overlay']
-                if not sized:
-                    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-                    scale = min(1.0, 900.0 / im.shape[0], 1600.0 / im.shape[1])
-                    cv2.resizeWindow(name, int(im.shape[1] * scale), int(im.shape[0] * scale))
-                    sized = True
-                cv2.imshow(name, im)
-            key = cv2.waitKey(50) & 0xFF
-            if key == ord('c'):
-                threading.Thread(target=self.try_calibrate, daemon=True).start()
-            elif key == ord('l'):
-                with self.lock:
-                    if not self.busy:
-                        self.show_calib = False
-        cv2.destroyAllWindows()
+                self.show_calib_until = time.time() + self.p('calib.hold_s')
 
     def run_calibration(self):
         log = self.get_logger().info
@@ -406,6 +388,7 @@ class FieldCalibNode(Node):
                                 im)
                 self.calib_views = views
                 self.publish_views('calib', views, header)
+                self.publish_debug(views['overlay'], header)
                 time.sleep(self.p('calib.stage_delay'))  # let viewers see every stage
 
             log(f'calibrating from {len(frames)} frames, {name} init, debug images -> {debug_dir}')
@@ -440,6 +423,7 @@ class FieldCalibNode(Node):
             cv2.imwrite(os.path.join(debug_dir, f'final_{v}.png'), im)
         self.calib_views = views
         self.publish_views('calib', views, header)
+        self.publish_debug(views['overlay'], header)
 
         tf1 = core.cam_tf_from_pose(p, R_lo, t_lo)
         rows = core.segment_stats(field, stage['diag'])

@@ -25,7 +25,7 @@ LAUNCH_DEFAULTS = {
     'depth.enable': True,
     'calib.apply': True,
     'calib.on_startup': 'if_missing',
-    'debug.window': True,
+    'calib.hold_s': 15.0,
 }
 
 ARGUMENTS = [

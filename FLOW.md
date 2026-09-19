@@ -201,10 +201,9 @@ flowchart TD
 ### ROS（`field_calib_node`）
 
 ```bash
-ros2 launch field_calib field_calib.launch.py   # 直接開 overlay debug 視窗（debug.window:=false 關閉），看法見 DEBUG.md
-#   視窗內按 c：開始校正（每輪 band 依序顯示）；按 l：回到 live 畫面
+ros2 launch field_calib field_calib.launch.py   # debug 畫面：/field_calib_node/debug/image（看法見 DEBUG.md）
 ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger   # 也可以用 service 觸發
-# 影像 topic：/field_calib_node/live/overlay、/field_calib_node/calib/{overlay,strips,residuals}
+# 其他影像 topic：/field_calib_node/live/overlay、/field_calib_node/calib/{overlay,strips,residuals}
 ```
 
 - **啟動**：有結果檔就直接發布；沒有就自動校正一次（`calib.on_startup`）。偵測到別的節點也在發布 `map→camera_link` 會 warn。

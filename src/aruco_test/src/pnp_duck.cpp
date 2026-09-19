@@ -43,6 +43,7 @@ public:
         this->declare_parameter<double>("pose_filter.max_jump_m", 0.15);
         this->declare_parameter<bool>("debug.enable", false);
         this->declare_parameter<bool>("debug.img", false);
+        this->declare_parameter<std::string>("debug.img_topic", "~/debug/image");
         this->declare_parameter<double>("camera_pose_refresh_s", 1.0);
         RGB_topic_ = this->get_parameter("RGB_topic").as_string();
         camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
@@ -60,6 +61,11 @@ public:
         pose_filter_max_jump_m_ = this->get_parameter("pose_filter.max_jump_m").as_double();
         is_debug_mode_ = this->get_parameter("debug.enable").as_bool();
         image_debug_ = this->get_parameter("debug.img").as_bool();
+        if (image_debug_) {
+            // Debug image as a topic (view with rqt_image_view / RViz) instead of an OpenCV window
+            debug_img_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+                this->get_parameter("debug.img_topic").as_string(), 1);
+        }
         camera_pose_refresh_s_ = this->get_parameter("camera_pose_refresh_s").as_double();
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -266,6 +272,12 @@ private:
         return std::sqrt(sum_sq / projected.size());
     }
 
+    void publish_debug_image(const cv::Mat &bgr, const std_msgs::msg::Header &header) {
+        if (debug_img_pub_) {
+            debug_img_pub_->publish(*cv_bridge::CvImage(header, "bgr8", bgr).toImageMsg());
+        }
+    }
+
     void RGB_img_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
         if (!is_camera_info_received_ || !is_camera_pose_initialized_) {
             RCLCPP_INFO(this->get_logger(), "Waiting for camera info and camera position...");
@@ -464,8 +476,7 @@ private:
                         cv::circle(RGB_frame, fitted, 3, cv::Scalar(0, 255, 255), -1);
                     }
                 }
-                cv::imshow("PnP Duck", RGB_frame);
-                cv::waitKey(1);
+                publish_debug_image(RGB_frame, msg->header);
             }
         }
     }
@@ -500,6 +511,7 @@ private:
 
     bool is_debug_mode_ = false;
     bool image_debug_ = false;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_img_pub_;
 
     bool is_camera_info_received_ = false;
     bool is_camera_pose_initialized_ = false;
