@@ -24,7 +24,7 @@ public:
         this->declare_parameter<std::string>("camera_info_topic", "/camera/camera/color/camera_info");
         this->declare_parameter<std::string>("pose_topic", "/duck/pose/homography");
         this->declare_parameter<double>("target_height", 0.447);
-        this->declare_parameter<int>("robot.id", 2);
+        this->declare_parameter<int>("robot.id", 1);
         this->declare_parameter<std::string>("world_frame", "map");
         this->declare_parameter<std::string>("camera_frame", "camera_color_optical_frame");
         this->declare_parameter<bool>("pose_filter.enable", false);
@@ -60,7 +60,7 @@ public:
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(pose_topic_, 10);
 
         // TODO: compare DICT_4X4_100 / APRILTAG_36h11 / APRILTAG_16h5 accuracy (see TODO.md)
-        dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_100);
+        dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_APRILTAG_16h5);
         detector_params_ = cv::aruco::DetectorParameters::create();
         detector_params_->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
         detector_params_->polygonalApproxAccuracyRate = 0.05;
@@ -356,7 +356,7 @@ private:
     double cam_x_ = 0.0, cam_y_ = 0.0, cam_z_ = 0.0;
     double target_height_;
 
-    int robot_id_ = 2;
+    int robot_id_ = 1;
 
     bool is_debug_mode_ = false;
     bool image_debug_ = false;

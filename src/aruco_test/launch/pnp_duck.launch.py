@@ -1,7 +1,6 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -33,29 +32,11 @@ ARGUMENTS = [
         description="Camera frame",
     ),
 
-	# Static camera TF (world_frame -> camera_link), measured by hand
-	DeclareLaunchArgument(
-        "cam_tf.enable",
-        default_value="true",
-        description="Publish static TF from world_frame to cam_tf.child_frame",
-    ),
-	DeclareLaunchArgument(
-        "cam_tf.child_frame",
-        default_value="camera_link",
-        description="Root frame of the RealSense TF tree",
-    ),
-	DeclareLaunchArgument("cam_tf.x", default_value="1.6759", description="Camera X in world frame (m)"),
-	DeclareLaunchArgument("cam_tf.y", default_value="2.0753", description="Camera Y in world frame (m)"),
-	DeclareLaunchArgument("cam_tf.z", default_value="1.4602", description="Camera Z in world frame (m)"),
-	DeclareLaunchArgument("cam_tf.roll", default_value="0.0", description="Camera roll (rad)"),
-	DeclareLaunchArgument("cam_tf.pitch", default_value="1.5708", description="Camera pitch (rad), 1.5708 = looking straight down"),
-	DeclareLaunchArgument("cam_tf.yaw", default_value="0.0", description="Camera yaw (rad)"),
-
 	# Target arguments
 	DeclareLaunchArgument(
         "robot.id",
-        default_value="2",
-        description="Robot marker ID (DICT_4X4_100)",
+        default_value="1",
+        description="Robot marker ID (DICT_APRILTAG_16h5)",
     ),
 	DeclareLaunchArgument(
         "robot.marker_size",
@@ -117,27 +98,8 @@ def generate_launch_description():
         ]
 	)
 
-	camera_static_tf = Node(
-		package='tf2_ros',
-		executable='static_transform_publisher',
-		name='camera_static_tf',
-		output='screen',
-		condition=IfCondition(LaunchConfiguration("cam_tf.enable")),
-		arguments=[
-			'--x', LaunchConfiguration("cam_tf.x"),
-			'--y', LaunchConfiguration("cam_tf.y"),
-			'--z', LaunchConfiguration("cam_tf.z"),
-			'--roll', LaunchConfiguration("cam_tf.roll"),
-			'--pitch', LaunchConfiguration("cam_tf.pitch"),
-			'--yaw', LaunchConfiguration("cam_tf.yaw"),
-			'--frame-id', LaunchConfiguration("world_frame"),
-			'--child-frame-id', LaunchConfiguration("cam_tf.child_frame"),
-		],
-	)
-
 	ld = LaunchDescription(ARGUMENTS)
 
-	ld.add_action(camera_static_tf)
 	ld.add_action(pnp_duck_node)
 
 	return ld

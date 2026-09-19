@@ -15,6 +15,7 @@ services:
     tty: true
     privileged: true
     network_mode: host
+    ipc: host
     # command: bash -c "${LAUNCH_SCRIPT}"
     working_dir: /home/vision/vision_ws
     <<: *ros2-vars

@@ -139,32 +139,44 @@ def launch_setup(context, params, param_name_suffix=''):
             )
     ]
 
-# 0: '0.0', '0.125', '0.30', '1.571', '0.7854', '-1.571' 前面相機z應該是錯的
-# 1: '0.125', '0.0', '0.30', '0.0', '0.7854', '-1.571'
-# 2: '0.0', '-0.125', '0.30', '-1.571', '0.7854', '-1.571'
-# 3: '-0.125', '0.0', '0.30', '-3.142', '0.7854', '-1.571'
-def launch_map_transform_publisher_node(context: LaunchContext):
-    # Only for a robot-mounted camera. A fixed overhead camera gets world -> camera_link from the
-    # localization launch files instead, and camera_link cannot have two parents.
-    if context.launch_configurations.get('base_tf.enable', 'false').lower() not in ('true', '1'):
+# Static TF world_frame -> <camera_name>_link for the fixed overhead camera (measured by hand).
+# Localization nodes only look this TF up; they do not publish it.
+cam_tf_parameters = [
+    {'name': 'cam_tf.enable',      'default': 'true',   'description': 'Publish static TF from cam_tf.world_frame to <camera_name>_link'},
+    {'name': 'cam_tf.world_frame', 'default': 'map',    'description': 'Parent frame of the camera'},
+    {'name': 'cam_tf.x',           'default': '0.91', 'description': 'Camera X in world frame (m)'},
+    {'name': 'cam_tf.y',           'default': '1.18', 'description': 'Camera Y in world frame (m)'},
+    {'name': 'cam_tf.z',           'default': '1.45', 'description': 'Camera Z in world frame (m)'},
+    {'name': 'cam_tf.roll',        'default': '0.0',    'description': 'Camera roll (rad)'},
+    {'name': 'cam_tf.pitch',       'default': '1.178', 'description': 'Camera pitch (rad), 1.5708 = looking straight down'},
+    {'name': 'cam_tf.yaw',         'default': '-1.5708',    'description': 'Camera yaw (rad)'},
+]
+
+def launch_camera_tf_node(context: LaunchContext):
+    cfg = context.launch_configurations
+    if cfg['cam_tf.enable'].lower() not in ('true', '1'):
         return []
     node = launch_ros.actions.Node(
-        name='map_transform_publisher',
-        package="tf2_ros",
-        executable="static_transform_publisher",
+        name='camera_static_tf',
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        output='screen',
         arguments=[
-            # 新的紅黑機數值
-            '0.91', '1.18', '1.45', '0.0', '1.178', '-1.571',
-            'base_footprint',
-            context.launch_configurations['camera_name'] + '_link'
+            '--x', cfg['cam_tf.x'],
+            '--y', cfg['cam_tf.y'],
+            '--z', cfg['cam_tf.z'],
+            '--roll', cfg['cam_tf.roll'],
+            '--pitch', cfg['cam_tf.pitch'],
+            '--yaw', cfg['cam_tf.yaw'],
+            '--frame-id', cfg['cam_tf.world_frame'],
+            '--child-frame-id', cfg['camera_name'] + '_link',
         ]
     )
     return [node]
 
 def generate_launch_description():
-    return LaunchDescription(declare_configurable_parameters(configurable_parameters) + [
-        DeclareLaunchArgument('base_tf.enable', default_value='false',
-                              description='Publish static TF base_footprint -> camera_link (robot-mounted camera only)'),
+    return LaunchDescription(declare_configurable_parameters(configurable_parameters) +
+                             declare_configurable_parameters(cam_tf_parameters) + [
         OpaqueFunction(function=launch_setup, kwargs = {'params' : set_configurable_parameters(configurable_parameters)}),
-        OpaqueFunction(function=launch_map_transform_publisher_node)  # Uncomment to enable static transform publisher
+        OpaqueFunction(function=launch_camera_tf_node)
     ])

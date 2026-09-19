@@ -23,7 +23,7 @@ public:
         this->declare_parameter<std::string>("RGB_topic", "/camera/camera/color/image_raw");
         this->declare_parameter<std::string>("camera_info_topic", "/camera/camera/color/camera_info");
         this->declare_parameter<std::string>("pose_topic", "/duck/pose/pnp");
-        this->declare_parameter<int>("robot.id", 2);
+        this->declare_parameter<int>("robot.id", 1);
         this->declare_parameter<double>("robot.marker_size", 0.1);
         this->declare_parameter<std::string>("world_frame", "map");
         this->declare_parameter<std::string>("camera_frame", "camera_color_optical_frame");
@@ -60,7 +60,7 @@ public:
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(pose_topic_, 10);
 
         // TODO: compare DICT_4X4_100 / APRILTAG_36h11 / APRILTAG_16h5 accuracy (see TODO.md)
-        dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_100);
+        dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_APRILTAG_16h5);
         detector_params_ = cv::aruco::DetectorParameters::create();
         detector_params_->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
         detector_params_->polygonalApproxAccuracyRate = 0.05;
@@ -341,7 +341,7 @@ private:
     Eigen::Isometry3d T_world_cam_ = Eigen::Isometry3d::Identity();
     std::vector<cv::Point3f> marker_obj_points_;
 
-    int robot_id_ = 2;
+    int robot_id_ = 1;
     double marker_size_ = 0.1;
 
     bool is_debug_mode_ = false;
