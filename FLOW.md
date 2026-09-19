@@ -175,3 +175,63 @@ flowchart LR
 
 - 兩個輸出的平均位置差不多，plane_lm 把抖動降了約 25–30 倍。
 - 剩下約 5 cm 的偏差兩者一致 → 仍是外參（cam_tf）問題。
+
+---
+
+## 6. 外參標定：桌邊線（`src/field_calib/`、`tools/calib/`）
+
+場地模型在 `src/field_calib/config/field.yaml`：兩張 180×60 cm 白桌，map 原點是上方桌子右上角（圓角延長線交點），z=0 是桌面。
+演算法只有一份（`src/field_calib/field_calib/core.py`），ROS 節點與離線 CLI 共用。
+
+```mermaid
+flowchart TD
+    SRC["ROS：field_calib_node（live 影像 + TF + depth）<br/>離線：capture_frames.py → npz → field_edge_calib.py"] --> MED["多幀 median → 灰階 + 輕微模糊"]
+    MED --> EXT
+    INIT["初值 = 目前 TF map→optical（cam_tf）"] --> EXT
+    EXT["每條模型線段（上桌 上/左/右、下桌 左/右/下、接縫）<br/>依目前位姿投影（含畸變），每 1 cm 取樣<br/>沿法線 ±band（裁到影像內）找：桌邊 = 白→地板最強梯度；接縫 = 最暗谷底<br/>每個取樣點記錄狀態：accepted / weak_gradient / low_contrast / at_band_edge"] --> LM
+    LM["6 DoF（+ 下桌 x 偏移）LM + Huber IRLS<br/>殘差 = undistort 後邊緣點到投影直線的距離；|r| ≥ 3δ 標為 huber_outlier"] --> DBG["每一輪輸出 debug：overlay / strips / residuals"]
+    DBG --> LOOP{"band 80→40→20→12 px"}
+    LOOP -- 下一輪 --> EXT
+    LOOP -- 完成 --> OUT["cam_tf.*（map→camera_link）、各線段統計、<br/>深度平面交叉檢查（ROS）、tag 在新舊外參下的位置"]
+```
+
+### ROS（`field_calib_node`）
+
+```bash
+ros2 launch field_calib field_calib.launch.py   # 直接開 overlay debug 視窗（debug.window:=false 關閉），看法見 DEBUG.md
+#   視窗內按 c：開始校正（每輪 band 依序顯示）；按 l：回到 live 畫面
+ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger   # 也可以用 service 觸發
+# 影像 topic：/field_calib_node/live/overlay、/field_calib_node/calib/{overlay,strips,residuals}
+```
+
+- **live**（每 `live.period` 秒）：用「目前的 TF」抓邊、算殘差（不優化）。桌緣對不上時會 warn（相機被碰、桌子被推、cam_tf 輸入錯）。
+- **calibrate**：收 `calib.frames` 幀 → 完整校正，每一輪 band 都發布到 `~/calib/*`（每輪停 `calib.stage_delay` 秒），PNG 與 `cam_tf.yaml` 存到 `calib.output_dir/<時間>/`。
+- 節點**不發布** `map→camera_link`（由 rs_launch.py 發布），結果要人工確認後用 `cam_tf.*:=` 套用。
+- 深度平面檢查：用 depth 擬合桌面平面，回報與桌緣解的法向量夾角、相機高度差（只回報，不進優化）。
+
+### 離線
+
+```bash
+python3 tools/calib/capture_frames.py --n 30 --out tools/calib/out/cap1.npz     # container
+python3 tools/calib/field_edge_calib.py tools/calib/out/cap1.npz [--show] [--disable lower_right]
+python3 tools/calib/field_edge_calib.py --selftest   # synthetic image, init off by 3 deg / 10 cm
+```
+
+### debug 畫面怎麼看
+- **overlay**：半透明色帶＝搜尋範圍；灰線＝本輪前模型、彩線＝本輪後；綠點＝採用，× 顏色＝剔除原因；右側 4 個角落放大、各線段統計。
+- **strips**：每條線段沿模型線拉直（橫＝沿線、縱＝法線方向放大 4×，**往下＝往地板**）。點應該落在白→暗交界上。
+- **residuals**：殘差 vs 沿線位置。常數偏移＝尺寸/位置、斜率＝旋轉或該邊不直、跳點＝誤抓（遮擋物、桌腳、線材）。
+
+### 2026-09-19 結果
+
+| | x | y | z | roll | pitch | yaw |
+|---|---:|---:|---:|---:|---:|---:|
+| 手量 | 0.9100 | 1.1800 | 1.3000 | 0.0000 | 1.1780 | −1.5708 |
+| 標定（14:40 cap1） | 0.9493 | 1.1759 | 1.2900 | **−0.0335** | 1.1697 | −1.5886 |
+| 標定（ROS，15:25） | 0.9491 | 1.1744 | 1.2899 | −0.0348 | 1.1705 | −1.5906 |
+
+- **使用中的 static TF roll 是 +0.03353（正負號錯）**，標定結果是 −0.03353。live 畫面裡模型線對不上桌緣就是這個原因（兩者差 3.8°），不是抓邊問題。
+- 4 次擷取在同一個固定位姿下比較，除了 lower_right（人站在旁邊、手壓在桌邊）之外，各邊在影像中的位置差 ≤ 0.4 px。
+- cam_tf 數字之間最多差 5 mm / 0.4°，但 x、roll、yaw 會互相抵消；換成「像素 → z=0.2 平面」的對應，整個桌面最大差 3.8 mm（平均 2 mm）。
+- 深度平面：法向量與桌緣解差 0.67°，相機高度 depth 1.314 m vs 桌緣 1.291 m（差 1.8%）。D455 深度本身有 1–2% 尺度誤差，**也可能是桌子實際尺寸不是 180×60**（例如 6 ft × 2 ft = 182.9×61 cm 會差 1.6%）→ 需要實際量桌子。
+- 桌子尺寸、桌緣圓角造成的偏差不會出現在重複性裡；定位誤差仍需在確認真值的點上量。

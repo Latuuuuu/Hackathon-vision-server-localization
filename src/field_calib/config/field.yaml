@@ -1,0 +1,27 @@
+# Field model for field_edge_calib.py (map frame, meters, z = 0 is the table top).
+#
+# Two white tables, each length x depth, butted along the long side:
+#
+#        x = length ............ x = 0      (map origin = top-right corner of the upper table,
+#   y=0   +----------------------+ <- origin  virtual sharp corner of the rounded edge)
+#         |      upper table     |           +X: along the top edge, to the left in the image
+#   y=d   +======== seam ========+           +Y: along the right edge, downward in the image
+#         |      lower table     |
+#   y=2d  +----------------------+
+table_length: 1.8
+table_depth: 0.6
+
+# Skip this much of every segment near the rounded table corners
+corner_exclusion: 0.08
+
+# Dark gap between the two tables at y = table_depth
+use_seam: true
+seam_weight: 0.5
+
+# Segments to leave out (e.g. an edge that is usually occluded). Names:
+# upper_top, upper_right, upper_left, lower_right, lower_left, lower_bottom, seam
+disabled_segments: []
+
+# Estimate an x offset of the lower table relative to the upper one
+# (upper table defines the map; the lower table only has to be parallel)
+fit_lower_dx: true

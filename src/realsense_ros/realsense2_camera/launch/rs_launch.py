@@ -144,12 +144,12 @@ def launch_setup(context, params, param_name_suffix=''):
 cam_tf_parameters = [
     {'name': 'cam_tf.enable',      'default': 'true',   'description': 'Publish static TF from cam_tf.world_frame to <camera_name>_link'},
     {'name': 'cam_tf.world_frame', 'default': 'map',    'description': 'Parent frame of the camera'},
-    {'name': 'cam_tf.x',           'default': '0.91', 'description': 'Camera X in world frame (m)'},
-    {'name': 'cam_tf.y',           'default': '1.18', 'description': 'Camera Y in world frame (m)'},
-    {'name': 'cam_tf.z',           'default': '1.3', 'description': 'Camera Z in world frame (m)'},
-    {'name': 'cam_tf.roll',        'default': '0.0',    'description': 'Camera roll (rad)'},
-    {'name': 'cam_tf.pitch',       'default': '1.178', 'description': 'Camera pitch (rad), 1.5708 = looking straight down'},
-    {'name': 'cam_tf.yaw',         'default': '-1.5708',    'description': 'Camera yaw (rad)'},
+    {'name': 'cam_tf.x',           'default': '0.94704', 'description': 'Camera X in world frame (m)'},
+    {'name': 'cam_tf.y',           'default': '1.17078', 'description': 'Camera Y in world frame (m)'},
+    {'name': 'cam_tf.z',           'default': '1.2925', 'description': 'Camera Z in world frame (m)'},
+    {'name': 'cam_tf.roll',        'default': '-0.03217',    'description': 'Camera roll (rad)'},
+    {'name': 'cam_tf.pitch',       'default': '1.17333', 'description': 'Camera pitch (rad), 1.5708 = looking straight down'},
+    {'name': 'cam_tf.yaw',         'default': '-1.58745',    'description': 'Camera yaw (rad)'},
 ]
 
 def launch_camera_tf_node(context: LaunchContext):
