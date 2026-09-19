@@ -11,6 +11,12 @@ from . import core
 
 SEG_COLORS = [(255, 180, 0), (0, 200, 255), (255, 0, 200), (0, 255, 128),
               (128, 128, 255), (255, 255, 0), (200, 200, 200)]
+
+
+def seg_color(j):
+    return SEG_COLORS[j % len(SEG_COLORS)]
+
+
 STATUS_COLORS = {
     core.ACCEPTED: (0, 255, 0),
     core.WEAK_GRADIENT: (0, 165, 255),
@@ -62,7 +68,7 @@ def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
         m = diag['seg'] == j
         u, n = diag['u_pred'][m], diag['nrm'][m]
         poly = np.concatenate([u + band * n, (u - band * n)[::-1]])
-        cv2.fillPoly(shade, [np.round(poly).astype(np.int32)], SEG_COLORS[j])
+        cv2.fillPoly(shade, [np.round(poly).astype(np.int32)], seg_color(j))
     canvas = cv2.addWeighted(shade, 0.12, canvas, 0.88, 0)
 
     # Model: before this stage (gray), after (segment colors)
@@ -75,7 +81,7 @@ def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
     A, B = field.endpoints(core.get_dx(p1))
     for j in range(len(field.segs)):
         uv = _project(np.linspace(A[j], B[j], 40), p1, K, D)
-        cv2.polylines(canvas, [np.round(uv).astype(np.int32)], False, SEG_COLORS[j], 2, cv2.LINE_AA)
+        cv2.polylines(canvas, [np.round(uv).astype(np.int32)], False, seg_color(j), 2, cv2.LINE_AA)
 
     # Samples
     for k in np.argsort(diag['status'] == core.ACCEPTED):  # rejected first, accepted on top
@@ -97,7 +103,7 @@ def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
     panel = np.full((max(h, 820), panel_w, 3), 30, np.uint8)
     crop = 50
     tile_sz = (panel_w - 30) // 2
-    names = ['origin (upper tr)', 'upper tl', 'lower bl', 'lower br']
+    names = ['origin (far right)', 'far left', 'near left', 'near right']
     for i, c in enumerate(_project(field.corners(core.get_dx(p1)), p1, K, D)):
         cx, cy = int(round(c[0])), int(round(c[1]))
         x0, y0 = cx - crop // 2, cy - crop // 2
@@ -121,7 +127,7 @@ def render_overlay(img_bgr, field, K, D, stage, delta, title=''):
         c = r['counts']
         _text(panel, f'{r["name"]:12s} {c[core.ACCEPTED]:3d}/{r["n"] - c[core.OUT_OF_IMAGE]:<3d} '
                      f'{c[core.WEAK_GRADIENT]:4d} {c[core.LOW_CONTRAST]:4d} {c[core.AT_BAND_EDGE]:4d} '
-                     f'{c[core.OUTLIER]:4d} {r["rms"]:5.2f} {r["mean"]:+5.2f}', (10, y), 0.42, SEG_COLORS[j])
+                     f'{c[core.OUTLIER]:4d} {r["rms"]:5.2f} {r["mean"]:+5.2f}', (10, y), 0.42, seg_color(j))
     y += 22
     _text(panel, 'mean > 0: detected edge outside model (floor side)', (10, y), 0.4, (180, 180, 180))
     y += 22
@@ -169,7 +175,7 @@ def render_strips(gray_u8, field, K, D, stage, max_half=20):
         P1 = A1[j] + s[:, None] * (B1[j] - A1[j])
         off1 = np.sum((_project(P1, p1, K, D) - u) * n, axis=1)
         pts = np.column_stack([np.arange(ncol), [row_of(o) for o in np.clip(off1, -half, half)]])
-        cv2.polylines(img, [pts.astype(np.int32)], False, SEG_COLORS[j], 1, cv2.LINE_AA)
+        cv2.polylines(img, [pts.astype(np.int32)], False, seg_color(j), 1, cv2.LINE_AA)
 
         # Detections
         m = np.where(diag['seg'] == j)[0]
@@ -187,7 +193,7 @@ def render_strips(gray_u8, field, K, D, stage, max_half=20):
         head = np.full((20, ncol, 3), 30, np.uint8)
         _text(head, f'{seg[0]}  acc {c["counts"][core.ACCEPTED]}/{c["n"]}  RMS {c["rms"]:.2f}  '
                     f'mean {c["mean"]:+.2f} px   (down = outward, +-{half}px x{ZOOM})', (4, 14), 0.42,
-              SEG_COLORS[j])
+              seg_color(j))
         strips.append(np.vstack([head, img]))
     width = max(s.shape[1] for s in strips)
     out = [cv2.copyMakeBorder(s, 0, 6, 0, width - s.shape[1], cv2.BORDER_CONSTANT, value=(30, 30, 30))
@@ -218,8 +224,8 @@ def render_residuals(field, stage, delta, clip=4.0, panel=(460, 130)):
         c = core.segment_stats(field, diag)[j]
         if not np.isnan(c['mean']):
             y = int(round(mid - np.clip(c['mean'], -clip, clip) * scale))
-            cv2.line(tile, (30, y), (pw - 5, y), SEG_COLORS[j], 1, cv2.LINE_AA)
-        _text(tile, f'{seg[0]}  RMS {c["rms"]:.2f}  mean {c["mean"]:+.2f} px', (32, 14), 0.42, SEG_COLORS[j])
+            cv2.line(tile, (30, y), (pw - 5, y), seg_color(j), 1, cv2.LINE_AA)
+        _text(tile, f'{seg[0]}  RMS {c["rms"]:.2f}  mean {c["mean"]:+.2f} px', (32, 14), 0.42, seg_color(j))
         tiles.append(tile)
     if len(tiles) % 2:
         blank = np.full((ph, pw, 3), 25, np.uint8)

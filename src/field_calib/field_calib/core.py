@@ -107,70 +107,100 @@ def pose_from_cam_tf(cam_tf, R_lo, t_lo):
 # Field model
 # ---------------------------------------------------------------------------
 class Field:
-    """Model segments on z = 0. Each segment: name, A(x, y), B(x, y), inward dir, kind, table."""
+    """Model segments on z = 0, built from the table size.
+
+    `count` tables of length x depth are butted along Y. Map origin = far corner of the first
+    table (see init_from_depth for how it is chosen), X along the length, Y along the stacking
+    direction. Each segment: name, A(x, y), B(x, y), inward dir, kind ('edge' / 'seam'),
+    table index (-1 for seams, which are not shifted by the per-table x offset).
+    """
 
     def __init__(self, cfg):
-        self.L = float(cfg['table_length'])
-        self.d = float(cfg['table_depth'])
+        table = cfg['table']
+        self.L = float(table['length'])
+        self.d = float(table['depth'])
+        self.count = int(table.get('count', 1))
+        if self.L <= 0 or self.d <= 0 or self.count < 1:
+            raise ValueError(f'invalid table size: {table}')
+        self.W = self.d * self.count
         self.ce = float(cfg['corner_exclusion'])
-        self.fit_dx = bool(cfg.get('fit_lower_dx', False))
-        L, d, ce = self.L, self.d, self.ce
-        segs = [
-            ('upper_top', (ce, 0.0), (L - ce, 0.0), (0, 1), 'edge', 'upper'),
-            ('upper_right', (0.0, ce), (0.0, d - ce), (1, 0), 'edge', 'upper'),
-            ('upper_left', (L, ce), (L, d - ce), (-1, 0), 'edge', 'upper'),
-            ('lower_right', (0.0, d + ce), (0.0, 2 * d - ce), (1, 0), 'edge', 'lower'),
-            ('lower_left', (L, d + ce), (L, 2 * d - ce), (-1, 0), 'edge', 'lower'),
-            ('lower_bottom', (ce, 2 * d), (L - ce, 2 * d), (0, -1), 'edge', 'lower'),
-        ]
+        # x offset of every table after the first (tables are not perfectly aligned)
+        self.fit_dx = bool(cfg.get('fit_table_dx', False)) and self.count > 1
+        self.n_dx = self.count - 1 if self.fit_dx else 0
+        L, d, ce, n = self.L, self.d, self.ce, self.count
+        # Order for count = 2 matches the original two-table model (same numeric results)
+        segs = [('far', (ce, 0.0), (L - ce, 0.0), (0, 1), 'edge', 0)]
+        for i in range(n):
+            y0 = i * d
+            segs.append((f'right_{i}', (0.0, y0 + ce), (0.0, y0 + d - ce), (1, 0), 'edge', i))
+            segs.append((f'left_{i}', (L, y0 + ce), (L, y0 + d - ce), (-1, 0), 'edge', i))
+        segs.append(('near', (ce, n * d), (L - ce, n * d), (0, -1), 'edge', n - 1))
         if cfg.get('use_seam', True):
-            segs.append(('seam', (ce, d), (L - ce, d), (0, 1), 'seam', 'both'))
+            for i in range(1, n):
+                segs.append((f'seam_{i}', (ce, i * d), (L - ce, i * d), (0, 1), 'seam', -1))
         disabled = set(cfg.get('disabled_segments') or [])
         unknown = disabled - {s[0] for s in segs}
         if unknown:
             raise ValueError(f'unknown segments in disabled_segments: {sorted(unknown)}')
+        self.all_names = [s[0] for s in segs]
         self.segs = [s for s in segs if s[0] not in disabled]
-        self.names = [s[0] for s in segs]
+        self.names = [s[0] for s in self.segs]
         self.weights = np.array([float(cfg.get('seam_weight', 0.5)) if s[4] == 'seam' else 1.0
-                                 for s in segs])
+                                 for s in self.segs])
+
+    def table_dx(self, dx):
+        """Per-table x offsets (table 0 is the reference)."""
+        out = np.zeros(self.count)
+        out[1:1 + len(dx)] = dx
+        return out
+
+    def extend_pose(self, p6):
+        """6-DoF pose -> full parameter vector (zero table offsets appended)."""
+        return np.concatenate([np.asarray(p6, dtype=np.float64)[:6], np.zeros(self.n_dx)])
 
     def endpoints(self, dx):
+        off = self.table_dx(dx)
         A = np.zeros((len(self.segs), 3))
         B = np.zeros((len(self.segs), 3))
         for i, (_, a, b, _, _, table) in enumerate(self.segs):
-            off = dx if table == 'lower' else 0.0
-            A[i, :2] = (a[0] + off, a[1])
-            B[i, :2] = (b[0] + off, b[1])
+            o = off[table] if table >= 0 else 0.0
+            A[i, :2] = (a[0] + o, a[1])
+            B[i, :2] = (b[0] + o, b[1])
         return A, B
 
     def inward(self, j):
         return np.array([self.segs[j][3][0], self.segs[j][3][1], 0.0])
 
     def outline(self, dx, n=60):
-        """Full table outlines (incl. corners) and the seam as world polylines, for drawing."""
+        """Full table outlines (incl. corners) as world polylines, for drawing."""
         L, d = self.L, self.d
         polys = []
-        for y0, off in ((0.0, 0.0), (d, dx)):
+        for i, off in enumerate(self.table_dx(dx)):
+            y0 = i * d
             c = np.array([[off, y0], [L + off, y0], [L + off, y0 + d], [off, y0 + d], [off, y0]])
-            pts = np.concatenate([np.linspace(c[i], c[i + 1], n) for i in range(4)])
+            pts = np.concatenate([np.linspace(c[k], c[k + 1], n) for k in range(4)])
             polys.append(np.column_stack([pts, np.zeros(len(pts))]))
         return polys
 
     def corners(self, dx):
-        """Outer field corners (world, z = 0): upper tr, upper tl, lower bl, lower br."""
-        L, d = self.L, self.d
-        return np.array([[0, 0, 0], [L, 0, 0], [L + dx, 2 * d, 0], [dx, 2 * d, 0]], dtype=np.float64)
+        """Outer field corners (world, z = 0): origin (far right), far left, near left, near right."""
+        L, W = self.L, self.W
+        last = self.table_dx(dx)[-1]
+        return np.array([[0, 0, 0], [L, 0, 0], [L + last, W, 0], [last, W, 0]], dtype=np.float64)
 
     def inside(self, X, Y, dx, margin):
         """Points on the table tops, shrunk by margin."""
         L, d = self.L, self.d
-        up = (X > margin) & (X < L - margin) & (Y > margin) & (Y < d - margin)
-        lo = (X > dx + margin) & (X < L + dx - margin) & (Y > d + margin) & (Y < 2 * d - margin)
-        return up | lo
+        mask = np.zeros(np.shape(X), dtype=bool)
+        for i, off in enumerate(self.table_dx(dx)):
+            y0 = i * d
+            mask |= (X > off + margin) & (X < L + off - margin) & (Y > y0 + margin) & (Y < y0 + d - margin)
+        return mask
 
 
 def get_dx(p):
-    return p[6] if len(p) > 6 else 0.0
+    """Table x offsets part of the parameter vector."""
+    return np.asarray(p[6:], dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -482,51 +512,156 @@ def tag_check(gray_u8, poses, K, D, tag_id, size, h):
 
 
 # ---------------------------------------------------------------------------
-# Depth plane cross-check
+# Depth: point cloud, plane fit, automatic initial pose, cross-check
 # ---------------------------------------------------------------------------
+def depth_points(depth_m, K_depth, R_cd, t_cd, max_points=60000, max_range=6.0):
+    """Depth image (meters, 0 = invalid, depth optical frame) -> points in the color optical frame.
+    R_cd, t_cd: depth -> color optical transform (p_color = R_cd p_depth + t_cd)."""
+    v, u = np.nonzero((depth_m > 0.1) & (depth_m < max_range))
+    step = max(1, len(u) // max_points)
+    u, v = u[::step], v[::step]
+    z = depth_m[v, u].astype(np.float64)
+    Xd = np.column_stack([(u - K_depth[0, 2]) / K_depth[0, 0] * z, (v - K_depth[1, 2]) / K_depth[1, 1] * z, z])
+    return Xd @ R_cd.T + t_cd
+
+
+def ransac_plane(X, inlier_m, iters=300, rng=None):
+    """Best plane by RANSAC + SVD refit on the inliers. Returns (n, c, inlier mask), n toward the camera."""
+    rng = rng if rng is not None else np.random.default_rng(0)
+    best, best_n = None, -1
+    for _ in range(iters):
+        s = X[rng.choice(len(X), 3, replace=False)]
+        n = np.cross(s[1] - s[0], s[2] - s[0])
+        if np.linalg.norm(n) < 1e-9:
+            continue
+        n /= np.linalg.norm(n)
+        cnt = np.count_nonzero(np.abs((X - s[0]) @ n) < inlier_m)
+        if cnt > best_n:
+            best, best_n = (n, s[0]), cnt
+    n, x0 = best
+    mask = np.abs((X - x0) @ n) < inlier_m
+    c = X[mask].mean(0)
+    d = X[mask] - c
+    n = np.linalg.eigh(d.T @ d)[1][:, 0]  # smallest-variance direction (3x3, no N x N SVD)
+    if n @ c > 0:  # camera (origin) on the +n side
+        n = -n
+    mask = np.abs((X - c) @ n) < inlier_m
+    return n, c, mask
+
+
+def init_from_depth(depth_m, K_depth, R_cd, t_cd, field, inlier_m=0.01, min_support=0.15,
+                    cell=0.01, size_tol=0.15, seed=0):
+    """Initial map -> color optical pose without any previous extrinsic (CALIBRATION.md Stage 2 + 3).
+
+    1. table plane = the closest large plane (the floor is further away)  -> roll, pitch, height
+    2. table-top region on that plane -> minimum-area rectangle          -> yaw, x, y
+    3. origin: of the two valid rectangle corners (X along the length, Y = Z x X pointing into the
+       table), the one farther from the point below the camera.
+    Returns (p, info); p is the full parameter vector (table offsets = 0).
+    """
+    X = depth_points(depth_m, K_depth, R_cd, t_cd)
+    if len(X) < 2000:
+        raise RuntimeError(f'too few depth points ({len(X)})')
+    rng = np.random.default_rng(seed)
+    planes, rest = [], np.ones(len(X), dtype=bool)
+    for _ in range(3):
+        idx = np.where(rest)[0]
+        if len(idx) < 0.05 * len(X):
+            break
+        n, c, m = ransac_plane(X[idx], inlier_m, rng=rng)
+        support = m.sum() / len(X)
+        if support < 0.05:
+            break
+        planes.append((float(-n @ c), n, c, idx[m], support))
+        rest[idx[m]] = False
+    cands = [pl for pl in planes if pl[4] >= min_support]
+    if not cands:
+        raise RuntimeError('no large plane found in the depth image')
+    h, n, c, idx, support = min(cands, key=lambda pl: pl[0])  # closest large plane = table top
+
+    # Plane frame: origin at the point below the camera, e1 / e2 in-plane, n up (toward the camera)
+    foot = (n @ c) * n
+    e1 = np.array([1.0, 0, 0]) - n[0] * n
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    uv = np.column_stack([(X[idx] - foot) @ e1, (X[idx] - foot) @ e2])
+    lo = uv.min(0)
+    ij = np.floor((uv - lo) / cell).astype(int)
+    if ij.max() > 2000:
+        raise RuntimeError(f'table plane spans {ij.max() * cell:.1f} m, not a table')
+    grid = np.zeros(ij.max(0)[::-1] + 1, np.uint8)
+    grid[ij[:, 1], ij[:, 0]] = 255
+    kernel = np.ones((5, 5), np.uint8)
+    grid = cv2.morphologyEx(cv2.morphologyEx(grid, cv2.MORPH_CLOSE, kernel), cv2.MORPH_OPEN, kernel)
+    n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(grid)
+    if n_lab < 2:
+        raise RuntimeError('table region not found on the plane')
+    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    ys, xs = np.nonzero(labels == best)
+    box = cv2.boxPoints(cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32)))
+    box = (box.astype(np.float64) + 0.5) * cell + lo  # plane 2D, meters
+    s01, s12 = np.linalg.norm(box[1] - box[0]), np.linalg.norm(box[2] - box[1])
+    # Which rectangle side is the table length
+    if abs(s01 - field.L) / field.L + abs(s12 - field.W) / field.W <= \
+            abs(s12 - field.L) / field.L + abs(s01 - field.W) / field.W:
+        len_side, wid_side = (s01, s12)
+    else:
+        len_side, wid_side = (s12, s01)
+    info = dict(height=h, plane_support=float(support), measured_length=len_side, measured_width=wid_side)
+    if abs(len_side - field.L) > size_tol * field.L or abs(wid_side - field.W) > size_tol * field.W:
+        raise RuntimeError(f'table region {len_side:.2f} x {wid_side:.2f} m does not match the input '
+                           f'{field.L:.2f} x {field.W:.2f} m (tolerance {size_tol * 100:.0f}%)')
+
+    # Candidate origins: corner k with X along the length side and Y = Z x X into the rectangle
+    center = box.mean(0)
+    best_o = None
+    for k in range(4):
+        for nb in ((k + 1) % 4, (k + 3) % 4):
+            side = box[nb] - box[k]
+            if abs(np.linalg.norm(side) - len_side) > 1e-6:
+                continue
+            x2 = side / np.linalg.norm(side)
+            y2 = np.array([-x2[1], x2[0]])  # Z x X in the (e1, e2, n) right-handed frame
+            if (center - box[k]) @ y2 <= 0:
+                continue
+            dist = np.linalg.norm(box[k])  # distance from the point below the camera
+            if best_o is None or dist > best_o[0]:
+                best_o = (dist, box[k], x2, y2)
+    _, o2, x2, y2 = best_o
+    Xc = x2[0] * e1 + x2[1] * e2
+    Yc = y2[0] * e1 + y2[1] * e2
+    R_cw = np.column_stack([Xc, Yc, n])  # world axes expressed in the camera frame
+    t_cw = foot + o2[0] * e1 + o2[1] * e2
+    rvec, _ = cv2.Rodrigues(R_cw)
+    return field.extend_pose(np.concatenate([rvec.ravel(), t_cw])), info
+
+
+def stage_quality(stage):
+    """Summary of the last calibration stage: accepted ratio, inlier RMS, accepted points."""
+    d = stage['diag']
+    considered = d['status'] != OUT_OF_IMAGE
+    acc = d['status'] == ACCEPTED
+    return dict(accept_ratio=float(acc.sum() / max(1, considered.sum())),
+                rms=float(np.sqrt(np.mean(d['resid'][acc] ** 2))) if acc.any() else float('inf'),
+                n_accepted=int(acc.sum()))
+
+
 def depth_plane_check(depth_m, K_depth, R_cd, t_cd, field, p, margin=0.10, z_gate=0.05,
                       ransac_iter=300, inlier_m=0.005, seed=0):
     """Fit the table plane from depth and compare with the edge solution.
-
-    depth_m: (H, W) depth in meters (0 = invalid), in the depth optical frame.
-    R_cd, t_cd: depth -> color optical transform (p_color = R_cd p_depth + t_cd).
-    Returns dict(n_points, inlier_ratio, tilt_deg, height_edge, height_depth) or None.
-    """
-    v, u = np.nonzero(depth_m > 0)
-    if len(u) < 1000:
+    Returns dict(n_points, inlier_ratio, tilt_deg, height_edge, height_depth) or None."""
+    Xc = depth_points(depth_m, K_depth, R_cd, t_cd)
+    if len(Xc) < 1000:
         return None
-    step = max(1, len(u) // 60000)
-    u, v = u[::step], v[::step]
-    z = depth_m[v, u]
-    Xd = np.column_stack([(u - K_depth[0, 2]) / K_depth[0, 0] * z, (v - K_depth[1, 2]) / K_depth[1, 1] * z, z])
-    Xc = Xd @ R_cd.T + t_cd
     R_wc, t_wc = world_cam_from_pose(p)
     Xw = Xc @ R_wc.T + t_wc
     keep = field.inside(Xw[:, 0], Xw[:, 1], get_dx(p), margin) & (np.abs(Xw[:, 2]) < z_gate)
     Xc = Xc[keep]
     if len(Xc) < 500:
         return None
-    rng = np.random.default_rng(seed)
-    best, best_n = None, -1
-    for _ in range(ransac_iter):
-        s = Xc[rng.choice(len(Xc), 3, replace=False)]
-        n = np.cross(s[1] - s[0], s[2] - s[0])
-        if np.linalg.norm(n) < 1e-9:
-            continue
-        n /= np.linalg.norm(n)
-        cnt = np.sum(np.abs((Xc - s[0]) @ n) < inlier_m)
-        if cnt > best_n:
-            best, best_n = (n, s[0]), cnt
-    n, x0 = best
-    inl = Xc[np.abs((Xc - x0) @ n) < inlier_m]
-    # Least-squares refit on the inliers
-    c = inl.mean(0)
-    _, _, vt = np.linalg.svd(inl - c)
-    n = vt[2]
-    if n @ c > 0:  # orient the normal toward the camera
-        n = -n
+    n, c, mask = ransac_plane(Xc, inlier_m, ransac_iter, np.random.default_rng(seed))
     # Edge solution: map +Z expressed in the camera frame, and the camera height
     z_cam = R_wc.T @ np.array([0, 0, 1.0])
-    return dict(n_points=int(len(Xc)), inlier_ratio=float(len(inl) / len(Xc)),
+    return dict(n_points=int(len(Xc)), inlier_ratio=float(mask.mean()),
                 tilt_deg=float(math.degrees(math.acos(min(1.0, abs(n @ z_cam))))),
                 height_depth=float(-n @ c), height_edge=float(t_wc[2]))

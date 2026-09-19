@@ -2,10 +2,12 @@
 
 live (timer)          : edge search + residuals under the current TF (no optimization)
                         -> ~/live/overlay, warns when the edges drift (camera bumped)
-~/calibrate (Trigger) : median of N frames -> full calibration, every band published to
-                        ~/calib/{overlay,strips,residuals} and saved as PNG; result written to yaml.
-                        The node never publishes map -> camera_link itself (rs_launch.py does);
-                        apply the printed cam_tf.* launch args after checking the result.
+~/calibrate (Trigger) : re-read the table size (field_file) -> median of N frames -> calibration from
+                        every available initial pose (depth plane + rectangle, current TF), best one kept
+                        -> if it passes the basic checks: publish map -> camera_link (static TF) and save
+                        it to calib.result_file. Every band is published to ~/calib/* and saved as PNG.
+startup               : publish the saved result; if there is none, calibrate once (calib.on_startup).
+This node is the only publisher of map -> camera_link (rs_launch.py cam_tf.enable defaults to false).
 """
 import datetime
 import os
@@ -23,12 +25,24 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
+from geometry_msgs.msg import TransformStamped
 from std_srvs.srv import Trigger
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
 
 from . import core, debug_viz
 
 VIEWS = ('overlay', 'strips', 'residuals')
+CAM_TF_NAMES = ('x', 'y', 'z', 'roll', 'pitch', 'yaw')
+
+
+def rot_to_quat(R):
+    """Rotation matrix -> quaternion (x, y, z, w)."""
+    rvec, _ = cv2.Rodrigues(np.asarray(R, dtype=np.float64))
+    angle = float(np.linalg.norm(rvec))
+    if angle < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0])
+    axis = rvec.ravel() / angle
+    return np.concatenate([axis * np.sin(angle / 2), [np.cos(angle / 2)]])
 
 
 def tf_to_rt(tf):
@@ -59,6 +73,11 @@ class FieldCalibNode(Node):
         dp('calib.bands', [80.0, 40.0, 20.0, 12.0])
         dp('calib.stage_delay', 1.0)
         dp('calib.output_dir', '~/.ros/field_calib')
+        dp('calib.result_file', '')          # '' = <output_dir>/cam_tf.yaml
+        dp('calib.on_startup', 'if_missing')  # if_missing / always / never
+        dp('calib.min_accept_ratio', 0.6)
+        dp('calib.max_rms_px', 1.5)
+        dp('calib.apply', True)  # false: dry run, never publish TF / write result_file
         dp('live.enable', True)
         dp('live.period', 1.0)
         dp('live.band', 12.0)
@@ -71,19 +90,14 @@ class FieldCalibNode(Node):
         dp('tag.height', 0.2)
         dp('debug.window', True)
 
-        field_file = self.p('field_file') or os.path.join(
-            get_package_share_directory('field_calib'), 'config', 'field.yaml')
-        with open(field_file) as f:
-            field_cfg = yaml.safe_load(f)
-        disabled = [s.strip() for s in self.p('field.disabled_segments').split(',') if s.strip()]
-        if disabled:
-            field_cfg['disabled_segments'] = disabled
-        self.field = core.Field(field_cfg)
-        self.get_logger().info(f'field {field_file}: segments {self.field.names}')
+        self.field = self.load_field()
 
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = StaticTransformBroadcaster(self)
+        self.published_cam_tf = None
+        self.published_dx = []  # table x offsets of the applied calibration
         self.lock = threading.Lock()
         self.K = self.D = self.K_depth = None
         self.latest = None
@@ -110,10 +124,82 @@ class FieldCalibNode(Node):
         if self.p('debug.window'):
             threading.Thread(target=self.display_loop, daemon=True).start()
             self.get_logger().info('debug window: press c to calibrate, l to return to the live view')
+        threading.Thread(target=self.startup, daemon=True).start()
         self.get_logger().info('ready: ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger')
 
     def p(self, name):
         return self.get_parameter(name).value
+
+    def load_field(self):
+        """Read the table size input (re-read on every calibration)."""
+        field_file = self.p('field_file') or os.path.join(
+            get_package_share_directory('field_calib'), 'config', 'field.yaml')
+        with open(field_file) as f:
+            field_cfg = yaml.safe_load(f)
+        disabled = [s.strip() for s in self.p('field.disabled_segments').split(',') if s.strip()]
+        if disabled:
+            field_cfg['disabled_segments'] = disabled
+        field = core.Field(field_cfg)
+        self.get_logger().info(f'table {field.L} x {field.d} m x {field.count} ({field_file}), '
+                               f'segments {field.names}')
+        return field
+
+    def result_file(self):
+        return os.path.expanduser(self.p('calib.result_file') or
+                                  os.path.join(self.p('calib.output_dir'), 'cam_tf.yaml'))
+
+    # ------------------------------------------------------------------ map -> camera_link
+    def publish_cam_tf(self, cam_tf):
+        """cam_tf = [x, y, z, roll, pitch, yaw] of map -> camera_link."""
+        q = rot_to_quat(core.rpy_to_rot(*cam_tf[3:6]))
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.p('world_frame')
+        msg.child_frame_id = self.p('link_frame')
+        msg.transform.translation.x, msg.transform.translation.y, msg.transform.translation.z = \
+            (float(v) for v in cam_tf[:3])
+        msg.transform.rotation.x, msg.transform.rotation.y, msg.transform.rotation.z, msg.transform.rotation.w = \
+            (float(v) for v in q)
+        self.tf_broadcaster.sendTransform(msg)
+        self.published_cam_tf = list(cam_tf)
+        self.get_logger().info('published ' + self.p('world_frame') + ' -> ' + self.p('link_frame') + ': ' +
+                               ' '.join(f'{n}={v:.5f}' for n, v in zip(CAM_TF_NAMES, cam_tf)))
+
+    def startup(self):
+        """Publish the saved extrinsic, or calibrate once when there is none."""
+        time.sleep(2.0)  # let the TF buffer fill
+        if self.tf_buffer.can_transform(self.p('world_frame'), self.p('link_frame'), Time()):
+            self.get_logger().warn(
+                f'{self.p("world_frame")} -> {self.p("link_frame")} is already published by another node '
+                '(rs_launch.py cam_tf.enable:=true?). Two publishers override each other; disable one.')
+        path, mode = self.result_file(), self.p('calib.on_startup')
+        saved = None
+        if os.path.exists(path):
+            with open(path) as f:
+                saved = (yaml.safe_load(f) or {}).get('cam_tf')
+        if not self.p('calib.apply'):
+            self.get_logger().info('dry run (calib.apply = false): not publishing any TF')
+            return
+        if saved and mode != 'always':
+            with open(path) as f:
+                self.published_dx = list((yaml.safe_load(f) or {}).get('table_dx') or [])
+            self.publish_cam_tf([saved[n] for n in CAM_TF_NAMES])
+            self.get_logger().info(f'loaded {path}')
+            return
+        if mode == 'never':
+            self.get_logger().warn(f'no saved extrinsic ({path}); press c or call ~/calibrate')
+            return
+        self.get_logger().info('no saved extrinsic: calibrating automatically')
+        t0 = time.time()
+        while time.time() - t0 < 30.0:
+            with self.lock:
+                ready = self.K is not None and self.latest is not None
+            if ready:
+                break
+            time.sleep(0.5)
+        ok, msg = self.try_calibrate()
+        if not ok:
+            self.get_logger().error(f'startup calibration failed: {msg}')
 
     # ------------------------------------------------------------------ sensors
     def on_info(self, msg):
@@ -143,10 +229,16 @@ class FieldCalibNode(Node):
     def lookup(self, parent, child):
         return tf_to_rt(self.tf_buffer.lookup_transform(parent, child, Time()).transform)
 
+    def tf_pose(self, field):
+        """Current TF as the full parameter vector of `field` (with the applied table offsets)."""
+        p = field.extend_pose(self.current_pose())
+        if len(self.published_dx) == field.n_dx:
+            p[6:] = self.published_dx
+        return p
+
     def current_pose(self):
         R_wc, t_wc = self.lookup(self.p('world_frame'), self.p('optical_frame'))
-        p = core.pose_from_world_cam(R_wc, t_wc)
-        return np.append(p, 0.0) if self.field.fit_dx else p
+        return core.pose_from_world_cam(R_wc, t_wc)  # 6-DoF; callers extend it for their field
 
     def publish_views(self, kind, views, header):
         for name, im in views.items():
@@ -169,15 +261,16 @@ class FieldCalibNode(Node):
             self.publish_views('calib', self.calib_views, header)  # keep the last result visible
         if busy or not self.p('live.enable'):
             return
+        field = self.field
         try:
-            p = self.current_pose()
+            p = self.tf_pose(field)
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f'TF not available: {e}', throttle_duration_sec=5.0)
             return
-        stage = core.evaluate(self.blurred(img), self.field, p, self.K, self.D, self.p('live.band'),
+        stage = core.evaluate(self.blurred(img), field, p, self.K, self.D, self.p('live.band'),
                               self.p('edge.step'), self.p('edge.grad_thresh'), self.p('edge.contrast_thresh'),
                               self.p('lm.delta'))
-        views = {'overlay': debug_viz.render_overlay(img, self.field, self.K, self.D, stage,
+        views = {'overlay': debug_viz.render_overlay(img, field, self.K, self.D, stage,
                                                      self.p('lm.delta'), 'live')}
         with self.lock:
             self.live_views = views
@@ -263,8 +356,12 @@ class FieldCalibNode(Node):
         log = self.get_logger().info
         if self.K is None:
             raise RuntimeError('no camera_info yet')
-        p0 = self.current_pose()
+        field = self.load_field()
         R_lo, t_lo = self.lookup(self.p('link_frame'), self.p('optical_frame'))
+        try:
+            p_tf = self.tf_pose(field)
+        except Exception:  # noqa: BLE001
+            p_tf = None
         frames, depth = self.collect(timeout=10.0)
         if len(frames) < 3:
             raise RuntimeError(f'only {len(frames)} frames received')
@@ -276,56 +373,103 @@ class FieldCalibNode(Node):
         debug_dir = os.path.join(out_dir, stamp)
         os.makedirs(debug_dir, exist_ok=True)
         delta = self.p('lm.delta')
+        lines = [f'table {field.L} x {field.d} m x {field.count}']
 
-        def on_stage(stage):
-            views = debug_viz.render_all(med, self.field, self.K, self.D, stage, delta, 'calib')
-            for name, im in views.items():
-                cv2.imwrite(os.path.join(debug_dir, f'band_{stage["index"]}_{stage["band"]:.0f}px_{name}.png'), im)
-            self.calib_views = views
-            self.publish_views('calib', views, header)
-            time.sleep(self.p('calib.stage_delay'))  # let viewers see every stage
-
-        log(f'calibrating from {len(frames)} frames, debug images -> {debug_dir}')
-        p, stage = core.calibrate(self.blurred(med), self.field, p0, self.K, self.D, list(self.p('calib.bands')),
-                                  self.p('edge.step'), self.p('edge.grad_thresh'),
-                                  self.p('edge.contrast_thresh'), delta, callback=on_stage, log=log)
-
-        names = ['x', 'y', 'z', 'roll', 'pitch', 'yaw']
-        tf0 = core.cam_tf_from_pose(p0, R_lo, t_lo)
-        tf1 = core.cam_tf_from_pose(p, R_lo, t_lo)
-        dmm, ddeg = core.pose_delta(p0, p)
-        rows = core.segment_stats(self.field, stage['diag'])
-        lines = ['per segment (last band):'] + core.format_segment_table(rows)
-        lines.append('cam_tf        current   calibrated')
-        for i, n in enumerate(names):
-            lines.append(f'  {n:6s} {tf0[i]:10.4f} {tf1[i]:11.4f}')
-        lines.append(f'camera moved {dmm:.1f} mm, rotation change {ddeg:.3f} deg')
-        if self.field.fit_dx:
-            lines.append(f'lower table x offset {p[6] * 1000:+.1f} mm')
-
-        depth_result = None
+        # Initial poses: depth plane + rectangle (no prior needed) and the current TF
+        dmed, R_cd, t_cd = None, None, None
         if depth and self.K_depth is not None:
             try:
                 R_cd, t_cd = self.lookup(self.p('optical_frame'), self.p('depth_frame'))
                 dmed = np.median(np.array(depth), axis=0)
-                depth_result = core.depth_plane_check(dmed, self.K_depth, R_cd, t_cd, self.field, p)
             except Exception as e:  # noqa: BLE001
-                lines.append(f'depth check failed: {e}')
+                lines.append(f'depth unavailable: {e}')
+        candidates = []
+        if dmed is not None:
+            try:
+                p_depth, info = core.init_from_depth(dmed, self.K_depth, R_cd, t_cd, field)
+                candidates.append(('depth', p_depth))
+                lines.append(f'depth init: table region {info["measured_length"]:.3f} x '
+                             f'{info["measured_width"]:.3f} m, camera height {info["height"]:.3f} m')
+            except RuntimeError as e:
+                lines.append(f'depth init failed: {e}')
+        if p_tf is not None:
+            candidates.append(('tf', p_tf))
+        if not candidates:
+            raise RuntimeError('no initial pose: depth init failed and no current TF\n' + '\n'.join(lines))
+
+        results = []
+        for name, p0 in candidates:
+            def on_stage(stage, name=name):
+                views = debug_viz.render_all(med, field, self.K, self.D, stage, delta, f'calib ({name} init)')
+                for v, im in views.items():
+                    cv2.imwrite(os.path.join(debug_dir, f'{name}_band_{stage["index"]}_{stage["band"]:.0f}px_{v}.png'),
+                                im)
+                self.calib_views = views
+                self.publish_views('calib', views, header)
+                time.sleep(self.p('calib.stage_delay'))  # let viewers see every stage
+
+            log(f'calibrating from {len(frames)} frames, {name} init, debug images -> {debug_dir}')
+            try:
+                p, stage = core.calibrate(self.blurred(med), field, p0, self.K, self.D,
+                                          list(self.p('calib.bands')), self.p('edge.step'),
+                                          self.p('edge.grad_thresh'), self.p('edge.contrast_thresh'), delta,
+                                          callback=on_stage, log=log)
+            except RuntimeError as e:
+                lines.append(f'{name} init: calibration failed: {e}')
+                continue
+            q = core.stage_quality(stage)
+            lines.append(f'{name} init: accepted {q["accept_ratio"] * 100:.1f}%, inlier RMS {q["rms"]:.3f} px')
+            results.append((name, p0, p, stage, q))
+        if not results:
+            raise RuntimeError('\n'.join(lines))
+        name, p0, p, stage, q = max(results, key=lambda r: (round(r[4]['accept_ratio'], 2), -r[4]['rms']))
+        if len(results) > 1:
+            dmm, ddeg = core.pose_delta(results[0][2], results[1][2])
+            lines.append(f'chosen: {name} init (the two results differ by {dmm:.1f} mm / {ddeg:.3f} deg)')
+
+        # Basic checks before touching the TF
+        problems = []
+        if q['accept_ratio'] < self.p('calib.min_accept_ratio'):
+            problems.append(f'accepted {q["accept_ratio"] * 100:.0f}% < {self.p("calib.min_accept_ratio") * 100:.0f}%')
+        if not q['rms'] <= self.p('calib.max_rms_px'):
+            problems.append(f'inlier RMS {q["rms"]:.2f} px > {self.p("calib.max_rms_px")} px')
+        passed = not problems
+        views = debug_viz.render_all(med, field, self.K, self.D, stage, delta,
+                                     'calib PASS' if passed else 'calib FAIL: ' + '; '.join(problems))
+        for v, im in views.items():
+            cv2.imwrite(os.path.join(debug_dir, f'final_{v}.png'), im)
+        self.calib_views = views
+        self.publish_views('calib', views, header)
+
+        tf1 = core.cam_tf_from_pose(p, R_lo, t_lo)
+        rows = core.segment_stats(field, stage['diag'])
+        lines += ['per segment (last band):'] + core.format_segment_table(rows)
+        lines.append('cam_tf        before   calibrated')
+        tf_before = self.published_cam_tf
+        for i, n in enumerate(CAM_TF_NAMES):
+            before = f'{tf_before[i]:10.4f}' if tf_before else '         -'
+            lines.append(f'  {n:6s} {before} {tf1[i]:11.4f}')
+        if field.n_dx:
+            lines.append(f'table x offsets (tables 1..): {np.round(core.get_dx(p) * 1000, 1)} mm')
+        depth_result = None
+        if dmed is not None:
+            depth_result = core.depth_plane_check(dmed, self.K_depth, R_cd, t_cd, field, p)
         if depth_result:
-            lines.append(f'depth plane: {depth_result["n_points"]} pts, inlier {depth_result["inlier_ratio"] * 100:.0f}%, '
-                         f'normal vs edge solution {depth_result["tilt_deg"]:.3f} deg, '
-                         f'camera height depth {depth_result["height_depth"]:.4f} m vs edge {depth_result["height_edge"]:.4f} m')
-        lines += core.tag_check(gray_u8, [('current', p0), ('calibrated', p)], self.K, self.D,
+            lines.append(f'depth plane: normal vs edge solution {depth_result["tilt_deg"]:.3f} deg, camera height '
+                         f'depth {depth_result["height_depth"]:.4f} m vs edge {depth_result["height_edge"]:.4f} m')
+        lines += core.tag_check(gray_u8, [('calibrated', p)], self.K, self.D,
                                 self.p('tag.id'), self.p('tag.size'), self.p('tag.height'))
-        launch = ' '.join(f'cam_tf.{n}:={v:.5f}' for n, v in zip(names, tf1))
-        lines.append('launch args: ' + launch)
 
         result = {
             'calibrated_at': stamp,
-            'cam_tf': {n: round(float(v), 5) for n, v in zip(names, tf1)},
-            'cam_tf_before': {n: round(float(v), 5) for n, v in zip(names, tf0)},
-            'lower_dx': round(float(p[6]), 5) if self.field.fit_dx else None,
+            'table': {'length': field.L, 'depth': field.d, 'count': field.count},
+            'cam_tf': {n: round(float(v), 5) for n, v in zip(CAM_TF_NAMES, tf1)},
+            'table_dx': [round(float(v), 5) for v in core.get_dx(p)],
+            'init': name,
+            'passed': passed,
+            'problems': problems,
             'quality': {
+                'accept_ratio': round(q['accept_ratio'], 4), 'rms_px': round(q['rms'], 4),
                 'segments': {r['name']: {'accepted': r['counts'][core.ACCEPTED], 'samples': r['n'],
                                          'rms_px': round(r['rms'], 3), 'mean_px': round(r['mean'], 3)}
                              for r in rows},
@@ -334,10 +478,25 @@ class FieldCalibNode(Node):
             },
             'debug_dir': debug_dir,
         }
-        for path in (os.path.join(debug_dir, 'cam_tf.yaml'), os.path.join(out_dir, 'cam_tf.yaml')):
-            with open(path, 'w') as f:
-                yaml.safe_dump(result, f, sort_keys=False)
-        lines.append(f'result: {os.path.join(out_dir, "cam_tf.yaml")}')
+        with open(os.path.join(debug_dir, 'cam_tf.yaml'), 'w') as f:
+            yaml.safe_dump(result, f, sort_keys=False)
+        if not passed:
+            text = '\n'.join(lines + ['NOT APPLIED: ' + '; '.join(problems)])
+            log('\n' + text)
+            raise RuntimeError(text)
+
+        if not self.p('calib.apply'):
+            text = '\n'.join(lines + ['DRY RUN (calib.apply = false): TF and result_file not changed'])
+            log('\n' + text)
+            return text
+        path = self.result_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            yaml.safe_dump(result, f, sort_keys=False)
+        self.published_dx = [float(v) for v in core.get_dx(p)]
+        self.publish_cam_tf(tf1)
+        self.field = field
+        lines.append(f'APPLIED: published map -> camera_link, saved {path}')
         text = '\n'.join(lines)
         log('\n' + text)
         return text

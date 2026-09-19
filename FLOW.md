@@ -15,18 +15,19 @@
 flowchart LR
     subgraph RS["rs_launch.py (realsense2_camera)"]
         CAM["realsense2_camera_node"]
-        STF["camera_static_tf<br/>static_transform_publisher<br/>cam_tf.* 手量外參"]
     end
+    FC["field_calib_node<br/>桌緣校正（輸入桌子尺寸）<br/>StaticTransformBroadcaster"]
 
     CAM -- "/camera/camera/color/image_raw" --> HD
     CAM -- "/camera/camera/color/camera_info" --> HD
     CAM -- "/camera/camera/color/image_raw" --> PD
     CAM -- "/camera/camera/color/camera_info" --> PD
 
-    STF -- "/tf_static<br/>map → camera_link" --> TF[("TF tree")]
+    FC -- "/tf_static<br/>map → camera_link（校正結果）" --> TF[("TF tree")]
+    CAM -- "color + depth" --> FC
     CAM -- "/tf_static<br/>camera_link → camera_color_optical_frame" --> TF
-    TF -- "lookup map → camera_color_optical_frame<br/>（只在啟動時查一次）" --> HD
-    TF -- "lookup map → camera_color_optical_frame<br/>（只在啟動時查一次）" --> PD
+    TF -- "lookup map → camera_color_optical_frame<br/>（每 camera_pose_refresh_s 秒重查）" --> HD
+    TF -- "lookup map → camera_color_optical_frame<br/>（每 camera_pose_refresh_s 秒重查）" --> PD
 
     PY[["config/param.yaml"]] -.-> HD
     PY -.-> PD
@@ -42,7 +43,7 @@ flowchart LR
 TF 樹：
 
 ```
-map ──(cam_tf.*, rs_launch.py)──> camera_link ──(RealSense 出廠)──> camera_color_frame ──> camera_color_optical_frame
+map ──(field_calib_node 校正結果)──> camera_link ──(RealSense 出廠)──> camera_color_frame ──> camera_color_optical_frame
  └──(debug)──> homo_duck_1 / plane_lm_duck_1 / pnp_duck_1 / pnp_plane_lm_duck_1
 ```
 
@@ -133,7 +134,7 @@ flowchart LR
 ```
 
 右邊蓋左邊。`ros2 run` 不經過 launch，只會有 C++ 預設 + `--ros-args -p`。
-相機外參不在 param.yaml，而是 `rs_launch.py` 的 `cam_tf.*` 參數。
+相機外參不在 param.yaml：由 `field_calib_node` 校正後發布（見第 6 節）。`rs_launch.py` 的 `cam_tf.*` 只剩手動備援（`cam_tf.enable` 預設 false）。
 
 ---
 
@@ -180,19 +181,21 @@ flowchart LR
 
 ## 6. 外參標定：桌邊線（`src/field_calib/`、`tools/calib/`）
 
-場地模型在 `src/field_calib/config/field.yaml`：兩張 180×60 cm 白桌，map 原點是上方桌子右上角（圓角延長線交點），z=0 是桌面。
+桌子尺寸由使用者輸入 `src/field_calib/config/field.yaml`（`table.length / depth / count`，每次校正重新讀取）。目前場地：兩張 180×60 cm 白桌。map 原點是離相機較遠的那個合法桌角（圓角延長線交點），z=0 是桌面。
 演算法只有一份（`src/field_calib/field_calib/core.py`），ROS 節點與離線 CLI 共用。
 
 ```mermaid
 flowchart TD
     SRC["ROS：field_calib_node（live 影像 + TF + depth）<br/>離線：capture_frames.py → npz → field_edge_calib.py"] --> MED["多幀 median → 灰階 + 輕微模糊"]
     MED --> EXT
-    INIT["初值 = 目前 TF map→optical（cam_tf）"] --> EXT
+    INIT["初值（兩組都跑，取較好的）<br/>1. 深度：桌面平面 → roll/pitch/高度；桌面範圍長方形 → yaw/x/y（不需舊外參）<br/>2. 目前 TF"] --> EXT
     EXT["每條模型線段（上桌 上/左/右、下桌 左/右/下、接縫）<br/>依目前位姿投影（含畸變），每 1 cm 取樣<br/>沿法線 ±band（裁到影像內）找：桌邊 = 白→地板最強梯度；接縫 = 最暗谷底<br/>每個取樣點記錄狀態：accepted / weak_gradient / low_contrast / at_band_edge"] --> LM
     LM["6 DoF（+ 下桌 x 偏移）LM + Huber IRLS<br/>殘差 = undistort 後邊緣點到投影直線的距離；|r| ≥ 3δ 標為 huber_outlier"] --> DBG["每一輪輸出 debug：overlay / strips / residuals"]
     DBG --> LOOP{"band 80→40→20→12 px"}
     LOOP -- 下一輪 --> EXT
-    LOOP -- 完成 --> OUT["cam_tf.*（map→camera_link）、各線段統計、<br/>深度平面交叉檢查（ROS）、tag 在新舊外參下的位置"]
+    LOOP -- 完成 --> CHK{"採用點比例、inlier RMS<br/>通過？"}
+    CHK -- 是 --> OUT["發布 map→camera_link（static TF）<br/>寫入結果檔（下次啟動載入）"]
+    CHK -- 否 --> KEEP["TF 不變，回報原因"]
 ```
 
 ### ROS（`field_calib_node`）
@@ -204,9 +207,11 @@ ros2 service call /field_calib_node/calibrate std_srvs/srv/Trigger   # 也可以
 # 影像 topic：/field_calib_node/live/overlay、/field_calib_node/calib/{overlay,strips,residuals}
 ```
 
-- **live**（每 `live.period` 秒）：用「目前的 TF」抓邊、算殘差（不優化）。桌緣對不上時會 warn（相機被碰、桌子被推、cam_tf 輸入錯）。
+- **啟動**：有結果檔就直接發布；沒有就自動校正一次（`calib.on_startup`）。偵測到別的節點也在發布 `map→camera_link` 會 warn。
+- **live**（每 `live.period` 秒）：用「目前的 TF」抓邊、算殘差（不優化）。桌緣對不上時會 warn（相機被碰、桌子被推）。
 - **calibrate**：收 `calib.frames` 幀 → 完整校正，每一輪 band 都發布到 `~/calib/*`（每輪停 `calib.stage_delay` 秒），PNG 與 `cam_tf.yaml` 存到 `calib.output_dir/<時間>/`。
-- 節點**不發布** `map→camera_link`（由 rs_launch.py 發布），結果要人工確認後用 `cam_tf.*:=` 套用。
+- 校正通過就重新發布 `map→camera_link` 並寫入結果檔；`pnp_duck` / `homography_duck` 約 1 秒內跟上（`camera_pose_refresh_s`），不用重啟。
+- `calib.apply:=false` 為 dry run：只計算，不動 TF 與結果檔。
 - 深度平面檢查：用 depth 擬合桌面平面，回報與桌緣解的法向量夾角、相機高度差（只回報，不進優化）。
 
 ### 離線
@@ -235,3 +240,11 @@ python3 tools/calib/field_edge_calib.py --selftest   # synthetic image, init off
 - cam_tf 數字之間最多差 5 mm / 0.4°，但 x、roll、yaw 會互相抵消；換成「像素 → z=0.2 平面」的對應，整個桌面最大差 3.8 mm（平均 2 mm）。
 - 深度平面：法向量與桌緣解差 0.67°，相機高度 depth 1.314 m vs 桌緣 1.291 m（差 1.8%）。D455 深度本身有 1–2% 尺度誤差，**也可能是桌子實際尺寸不是 180×60**（例如 6 ft × 2 ft = 182.9×61 cm 會差 1.6%）→ 需要實際量桌子。
 - 桌子尺寸、桌緣圓角造成的偏差不會出現在重複性裡；定位誤差仍需在確認真值的點上量。
+
+### 2026-09-19 下午：輸入尺寸 + 自動初值 + 自動套用
+
+- 合成測試：3 種相機位置、不給舊外參，深度初值偏 0–1°、3–5 cm，校正後 < 0.01°、< 0.3 mm，原點都選對。
+- 實機 dry run（相機或桌子在上午校正後已被移動，舊外參 live 只剩 15% 對得上）：
+  深度初值與舊 TF 初值收斂到同一個解（差 0.5 mm / 0.014°），採用 87%、inlier RMS 0.84 px（right_1 被人擋住）。
+- 深度量到的桌面範圍 1.877 × 1.245 m（輸入 1.8 × 1.2），深度高度 1.315 m vs 桌緣解 1.302 m。
+  兩者都約大 1–4%，仍無法分辨是深度尺度誤差還是桌子實際尺寸，需實際量桌子。

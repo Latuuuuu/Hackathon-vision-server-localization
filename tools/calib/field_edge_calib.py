@@ -82,12 +82,15 @@ def main():
         def cb(stage):
             sink_holder['sink'](stage)
         p_true = core.pose_from_cam_tf(synthetic.CAM_TF, core.quat_to_rot(synthetic.Q_LO), synthetic.T_LO)
-        gray = synthetic.render_scene(field, p_true, 0.012 if field.fit_dx else 0.0)
+        gray = synthetic.render_scene(field, p_true, synthetic.true_table_dx(field))
         sink_holder['sink'] = DebugSink(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), field, synthetic.K, synthetic.D,
                                         args.delta, os.path.join(args.out_dir, 'debug_selftest'), args.show,
                                         'selftest')
         ok, _, _ = synthetic.selftest(field, args.bands, args.step, args.blur, args.grad_thresh,
                                       args.contrast_thresh, args.delta, callback=cb)
+        print('\nno previous extrinsic: depth initialization')
+        ok &= synthetic.selftest_auto(field, args.bands, args.step, args.blur, args.grad_thresh,
+                                      args.contrast_thresh, args.delta)
         print('selftest', 'PASSED' if ok else 'FAILED')
         sys.exit(0 if ok else 1)
     if not args.capture:
@@ -102,9 +105,7 @@ def main():
     gray = cv2.GaussianBlur(gray_u8.astype(np.float32), (0, 0), args.blur)
     R_lo, t_lo = core.quat_to_rot(cap['q_link_opt']), cap['t_link_opt']
 
-    p0 = core.pose_from_world_cam(core.quat_to_rot(cap['q']), cap['t'])
-    if field.fit_dx:
-        p0 = np.append(p0, 0.0)
+    p0 = field.extend_pose(core.pose_from_world_cam(core.quat_to_rot(cap['q']), cap['t']))
     print(f'{len(cap["frames"])} frames, {len(field.segs)} segments')
     sink = DebugSink(med, field, K, D, args.delta, debug_dir, args.show,
                      os.path.splitext(os.path.basename(args.capture))[0])
@@ -132,15 +133,15 @@ def main():
     print(f'  camera moved {dmm:.1f} mm, rotation change {ddeg:.3f} deg')
     print(f'  statistical 1-sigma: camera center {np.round(np.sqrt(np.diag(cov_c)) * 1000, 2)} mm, '
           f'rotation {np.round(rot_std, 3)} deg (edge noise only, excludes table size / lip bias)')
-    if field.fit_dx:
-        print(f'  lower table x offset: {p[6] * 1000:+.1f} mm')
+    if field.n_dx:
+        print(f'  table x offsets (tables 1..): {np.round(core.get_dx(p) * 1000, 1)} mm')
 
     os.makedirs(args.out_dir, exist_ok=True)
     out_yaml = os.path.join(args.out_dir, 'cam_tf.yaml')
     with open(out_yaml, 'w') as f:
         yaml.safe_dump({'source': os.path.abspath(args.capture),
                         'cam_tf': {n: round(float(v), 5) for n, v in zip(names, tf1)},
-                        'lower_dx': round(float(p[6]), 5) if field.fit_dx else None}, f, sort_keys=False)
+                        'table_dx': [round(float(v), 5) for v in core.get_dx(p)]}, f, sort_keys=False)
     print(f'\nwrote {out_yaml} and debug images in {debug_dir}')
     print('launch args: ' + ' '.join(f'cam_tf.{n}:={v:.5f}' for n, v in zip(names, tf1)))
     print()

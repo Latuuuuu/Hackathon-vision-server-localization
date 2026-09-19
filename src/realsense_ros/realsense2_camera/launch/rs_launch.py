@@ -142,7 +142,7 @@ def launch_setup(context, params, param_name_suffix=''):
 # Static TF world_frame -> <camera_name>_link for the fixed overhead camera (measured by hand).
 # Localization nodes only look this TF up; they do not publish it.
 cam_tf_parameters = [
-    {'name': 'cam_tf.enable',      'default': 'true',   'description': 'Publish static TF from cam_tf.world_frame to <camera_name>_link'},
+    {'name': 'cam_tf.enable',      'default': 'false',  'description': 'Publish static TF from cam_tf.world_frame to <camera_name>_link (off: field_calib_node publishes the calibrated one)'},
     {'name': 'cam_tf.world_frame', 'default': 'map',    'description': 'Parent frame of the camera'},
     {'name': 'cam_tf.x',           'default': '0.94704', 'description': 'Camera X in world frame (m)'},
     {'name': 'cam_tf.y',           'default': '1.17078', 'description': 'Camera Y in world frame (m)'},

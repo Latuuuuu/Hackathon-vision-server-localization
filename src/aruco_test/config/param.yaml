@@ -11,6 +11,7 @@
     world_frame: map
     camera_frame: camera_color_optical_frame
     target_height: 0.2     # tag surface height above map z=0 (m), used by plane LM in both nodes
+    camera_pose_refresh_s: 1.0   # re-read map -> camera TF every N s (new calibration without restart), 0 = off
 
     robot:
       id: 1                # DICT_APRILTAG_16h5

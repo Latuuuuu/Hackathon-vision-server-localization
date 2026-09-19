@@ -23,6 +23,7 @@ LAUNCH_DEFAULTS = {
     'robot.id': 1,
     'robot.marker_size': 0.1,
     'target_height': 0.2,
+    'camera_pose_refresh_s': 1.0,
     'plane_lm.enable': True,
     'plane_lm.pose_topic': '/pose/global/pnp_plane_lm',
     'plane_lm.max_iter': 15,

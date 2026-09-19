@@ -21,6 +21,7 @@ LAUNCH_DEFAULTS = {
     'world_frame': 'map',
     'camera_frame': 'camera_color_optical_frame',
     'target_height': 0.2,
+    'camera_pose_refresh_s': 1.0,
     'robot.id': 1,
     'robot.marker_size': 0.1,
     'plane_lm.enable': True,

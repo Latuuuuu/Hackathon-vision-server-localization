@@ -23,6 +23,8 @@ LAUNCH_DEFAULTS = {
     'live.enable': True,
     'live.period': 1.0,
     'depth.enable': True,
+    'calib.apply': True,
+    'calib.on_startup': 'if_missing',
     'debug.window': True,
 }
 

@@ -13,6 +13,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #include "aruco_test/plane_lm.hpp"
@@ -41,6 +42,7 @@ public:
         this->declare_parameter<double>("pose_filter.max_jump_m", 0.15);
         this->declare_parameter<bool>("debug.enable", false);
         this->declare_parameter<bool>("debug.img", false);
+        this->declare_parameter<double>("camera_pose_refresh_s", 1.0);
         RGB_topic_ = this->get_parameter("RGB_topic").as_string();
         camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
         pose_topic_ = this->get_parameter("pose_topic").as_string();
@@ -57,10 +59,17 @@ public:
         pose_filter_max_jump_m_ = this->get_parameter("pose_filter.max_jump_m").as_double();
         is_debug_mode_ = this->get_parameter("debug.enable").as_bool();
         image_debug_ = this->get_parameter("debug.img").as_bool();
+        camera_pose_refresh_s_ = this->get_parameter("camera_pose_refresh_s").as_double();
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        if (camera_pose_refresh_s_ > 0.0) {
+            // Pick up a new extrinsic (e.g. from field_calib_node) without restarting
+            camera_pose_timer_ = this->create_wall_timer(
+                std::chrono::duration<double>(camera_pose_refresh_s_),
+                std::bind(&HomographyDuckNode::refresh_camera_pose, this));
+        }
 
         camera_info_subscriber_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
             camera_info_topic_, 10,
@@ -165,6 +174,28 @@ private:
     }
 
     // Build the image -> ground(z=0) homography from camera extrinsics and intrinsics
+    // Re-read world -> camera and rebuild only when the transform actually changed
+    void refresh_camera_pose() {
+        if (!is_camera_info_received_ || !is_camera_position_initialized_) {
+            return;
+        }
+        geometry_msgs::msg::TransformStamped tf_msg;
+        try {
+            tf_msg = tf_buffer_->lookupTransform(world_frame_, camera_frame_, tf2::TimePointZero);
+        } catch (tf2::TransformException &) {
+            return;
+        }
+        const Eigen::Isometry3d T_new = tf2::transformToEigen(tf_msg);
+        const double moved = (T_new.translation() - T_cam_last_.translation()).norm();
+        const double rotated = Eigen::AngleAxisd(T_new.rotation().transpose() * T_cam_last_.rotation()).angle();
+        if (moved < 1e-6 && rotated < 1e-8) {
+            return;
+        }
+        init_ground_homography();
+        RCLCPP_INFO(this->get_logger(), "camera pose updated: moved %.1f mm, rotated %.3f deg",
+            moved * 1000.0, rotated * 180.0 / M_PI);
+    }
+
     void init_ground_homography() {
         if (!is_camera_info_received_) {
             return;
@@ -172,6 +203,7 @@ private:
         try {
             auto tf_msg = tf_buffer_->lookupTransform(world_frame_, camera_frame_, tf2::TimePointZero);
             const Eigen::Isometry3d T_world_cam = tf2::transformToEigen(tf_msg);
+            T_cam_last_ = T_world_cam;
 
             cam_x_ = T_world_cam.translation().x();
             cam_y_ = T_world_cam.translation().y();
@@ -463,6 +495,9 @@ private:
 
     bool is_camera_info_received_ = false;
     bool is_camera_position_initialized_ = false;
+    double camera_pose_refresh_s_ = 1.0;
+    rclcpp::TimerBase::SharedPtr camera_pose_timer_;
+    Eigen::Isometry3d T_cam_last_ = Eigen::Isometry3d::Identity();  // last applied world -> camera
     bool pose_filter_enable_ = true;
     double pose_filter_alpha_ = 0.2;
     double pose_filter_max_jump_m_ = 0.5;
