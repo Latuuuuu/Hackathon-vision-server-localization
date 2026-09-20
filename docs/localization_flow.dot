@@ -29,7 +29,7 @@ digraph localization {
 
     tf [label="TF tree\nmap → camera_link → camera_color_optical_frame", shape=cylinder, fillcolor="#fef0c7", color="#f79009"];
     app [label="App Gateway → 瀏覽器\n(BEST_EFFORT 訂閱)", fillcolor="#f4f3ff", color="#9b8afb"];
-    out [label="/pose/global\nPoseWithCovarianceStamped\n最終定位 (x, y, yaw), z = 0.2", shape=box, style="rounded,filled,bold", fillcolor="#fee4c8", color="#f79009", penwidth=2];
+    out [label="/pose/global\nPoseWithCovarianceStamped\n最終定位 (x, y, yaw), z = 0.2\nyaw 含 tag 安裝偏移 −90°", shape=box, style="rounded,filled,bold", fillcolor="#fee4c8", color="#f79009", penwidth=2];
 
     cam -> fc   [label="color image + camera_info\ndepth + camera_info"];
     cam -> pnp  [label="color image + camera_info"];

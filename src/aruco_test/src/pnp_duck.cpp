@@ -28,7 +28,8 @@
 //                         3-DoF (x, y, yaw) LM on image reprojection error with the tag kept level
 //   final_pose_topic    : the final localization output (/pose/global), PoseWithCovarianceStamped:
 //                         plane LM result, raw PnP when the LM is disabled or not available for this
-//                         frame. The covariance is a fixed guess from final_pose_cov.* (see param.yaml)
+//                         frame, rotated by final_pose_yaw_offset_deg about z (how the tag is mounted
+//                         on the robot). The covariance is a fixed guess from final_pose_cov.*
 class PnpDuckNode : public rclcpp::Node {
 public:
     PnpDuckNode() : Node("pnp_duck_node") {
@@ -43,6 +44,8 @@ public:
         this->declare_parameter<std::string>("final_pose_topic", "/pose/global");
         // Fixed 1-sigma guesses for the final pose; x/y are dominated by the extrinsic and the table
         // size (mm level), not by the per-frame LM jitter (~0.1 mm). roll/pitch/z are assumed, not measured.
+        // Tag mounting: yaw offset from the tag frame to the robot frame, about z
+        this->declare_parameter<double>("final_pose_yaw_offset_deg", -90.0);
         this->declare_parameter<double>("final_pose_cov.sigma_xy_m", 0.005);
         this->declare_parameter<double>("final_pose_cov.sigma_z_m", 0.01);
         this->declare_parameter<double>("final_pose_cov.sigma_yaw_deg", 1.0);
@@ -66,6 +69,7 @@ public:
         plane_lm_enable_ = this->get_parameter("plane_lm.enable").as_bool();
         plane_lm_pose_topic_ = this->get_parameter("plane_lm.pose_topic").as_string();
         final_pose_topic_ = this->get_parameter("final_pose_topic").as_string();
+        final_pose_yaw_offset_ = this->get_parameter("final_pose_yaw_offset_deg").as_double() * M_PI / 180.0;
         const double sigma_xy = this->get_parameter("final_pose_cov.sigma_xy_m").as_double();
         const double sigma_z = this->get_parameter("final_pose_cov.sigma_z_m").as_double();
         const double sigma_yaw = this->get_parameter("final_pose_cov.sigma_yaw_deg").as_double() * M_PI / 180.0;
@@ -277,6 +281,10 @@ private:
         return true;
     }
 
+    static double wrap_angle(double a) {
+        return std::atan2(std::sin(a), std::cos(a));
+    }
+
     static Eigen::Isometry3d cv_pose_to_eigen(const cv::Mat &rvec, const cv::Mat &tvec) {
         cv::Mat R_cv;
         cv::Rodrigues(rvec, R_cv);
@@ -440,6 +448,13 @@ private:
                     geometry_msgs::msg::PoseWithCovarianceStamped final_msg;
                     final_msg.header = best.header;
                     final_msg.pose.pose = best.pose;
+                    // Rotate about z into the robot frame (tag mounting); the position is unchanged
+                    const double tag_yaw = 2.0 * std::atan2(best.pose.orientation.z, best.pose.orientation.w);
+                    const double half_yaw = wrap_angle(tag_yaw + final_pose_yaw_offset_) * 0.5;
+                    final_msg.pose.pose.orientation.x = 0.0;
+                    final_msg.pose.pose.orientation.y = 0.0;
+                    final_msg.pose.pose.orientation.z = std::sin(half_yaw);
+                    final_msg.pose.pose.orientation.w = std::cos(half_yaw);
                     final_msg.pose.covariance = final_pose_cov_;
                     final_pose_pub_->publish(final_msg);
                 }
@@ -526,6 +541,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr plane_lm_pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr final_pose_pub_;
     std::string final_pose_topic_;
+    double final_pose_yaw_offset_ = 0.0;
     std::array<double, 36> final_pose_cov_{};
     std::string RGB_topic_;
     std::string camera_info_topic_;

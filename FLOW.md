@@ -5,7 +5,7 @@
 | 節點 | 方法 | 輸出 |
 |---|---|---|
 | `homography_duck_node` | tag 固定在已知高度的水平面上（3 DoF：x, y, yaw）（比較用） | `/pose/global/homography`（閉式解）、`/duck/pose/plane_lm`（LM refine） |
-| `pnp_duck_node` | solvePnP 自由 6 DoF，再轉到 map；再以 PnP 為初值做平面約束 LM | **`/pose/global`（最終定位輸出，`PoseWithCovarianceStamped` = LM refine，LM 不可用時退回原始 PnP）**、`/pose/global/pnp`（原始 PnP）、`/pose/global/pnp_plane_lm`（LM refine） |
+| `pnp_duck_node` | solvePnP 自由 6 DoF，再轉到 map；再以 PnP 為初值做平面約束 LM | **`/pose/global`（最終定位輸出，`PoseWithCovarianceStamped` = LM refine 繞 z 轉 `final_pose_yaw_offset_deg`，LM 不可用時退回原始 PnP）**、`/pose/global/pnp`（原始 PnP）、`/pose/global/pnp_plane_lm`（LM refine） |
 
 ---
 
@@ -117,7 +117,7 @@ flowchart TD
     RAY --> LM["3-DoF LM refine (x, y, yaw)<br/>殘差 = projectPoints(含畸變) − raw corners<br/>tag 限制在 z=h 水平面（共用 plane_lm.hpp）"]
     LM --> F2["pose_filter（EMA，獨立 state）"]
     F2 --> P2[/"plane_lm.pose_topic<br/>z 固定 = target_height"/]
-    P2 --> PF[/"final_pose_topic = /pose/global<br/>PoseWithCovarianceStamped<br/>covariance 由 final_pose_cov.* 給固定值<br/>（LM 不可用時改發原始 PnP）"/]
+    P2 --> PF[/"final_pose_topic = /pose/global<br/>PoseWithCovarianceStamped<br/>yaw += final_pose_yaw_offset_deg（tag 安裝方向，預設 −90°）<br/>covariance 由 final_pose_cov.* 給固定值<br/>（LM 不可用時改發原始 PnP）"/]
     P1 -. "LM 不可用時" .-> PF
 
     P1 --> DBG
@@ -258,7 +258,9 @@ python3 tools/calib/field_edge_calib.py --selftest   # synthetic image, init off
 - 深度量到的桌面範圍 1.877 × 1.245 m（輸入 1.8 × 1.2），深度高度 1.315 m vs 桌緣解 1.302 m。
   兩者都約大 1–4%，仍無法分辨是深度尺度誤差還是桌子實際尺寸，需實際量桌子。
 
-### /pose/global 的 covariance（2026-09-20）
+### /pose/global 的型別、yaw 偏移與 covariance（2026-09-20）
+
+`final_pose_yaw_offset_deg`（預設 **−90**）是 tag 座標系轉到機器人座標系的繞 z 旋轉，對應 tag 實際貼在機器人上的方向。只影響 `/pose/global` 的 yaw，位置不變；`/pose/global/pnp`、`/pose/global/pnp_plane_lm` 仍是 tag 本身的朝向。
 
 型別是 `geometry_msgs/PoseWithCovarianceStamped`，covariance 是**參數給的固定值**（`final_pose_cov.*`，對角線，row-major x, y, z, roll, pitch, yaw）：
 

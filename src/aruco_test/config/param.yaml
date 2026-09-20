@@ -39,6 +39,7 @@ pnp_duck_node:
   ros__parameters:
     pose_topic: /pose/global/pnp
     final_pose_topic: /pose/global     # final output: plane LM (raw PnP fallback); '' = off
+    final_pose_yaw_offset_deg: -90.0   # tag frame -> robot frame, about z (how the tag is mounted)
     final_pose_cov:                    # fixed 1-sigma of the final pose (geometry_msgs/PoseWithCovarianceStamped)
       sigma_xy_m: 0.005                # extrinsic + table size dominate; LM jitter alone is ~0.1 mm
       sigma_z_m: 0.01                  # z is assumed = target_height, not measured

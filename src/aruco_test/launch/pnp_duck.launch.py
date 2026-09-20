@@ -27,6 +27,7 @@ LAUNCH_DEFAULTS = {
     'plane_lm.enable': True,
     'plane_lm.pose_topic': '/pose/global/pnp_plane_lm',
     'final_pose_topic': '/pose/global',
+    'final_pose_yaw_offset_deg': -90.0,
     'final_pose_cov.sigma_xy_m': 0.005,
     'final_pose_cov.sigma_z_m': 0.01,
     'final_pose_cov.sigma_yaw_deg': 1.0,
