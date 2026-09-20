@@ -20,6 +20,10 @@
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
 
+  <!-- localization_bringup.launch.py includes these -->
+  <exec_depend>field_calib</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+
   <exec_depend>opencv</exec_depend>
 
   <export>

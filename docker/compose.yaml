@@ -15,15 +15,26 @@ services:
     privileged: true
     network_mode: host
     ipc: host
-    # command: bash -c "${LAUNCH_SCRIPT}"
+    # Build if needed, then bring up camera + calibration + localization.
+    # Override what is started with LAUNCH_ARGS, e.g.
+    #   LAUNCH_ARGS="live.compact:=true live.period:=0.1" docker compose up -d
+    #   LAUNCH_ARGS="camera:=false localization:=false" docker compose up -d
+    # Just a shell instead: docker compose run --rm hackathon-vision-server-ws bash
+    entrypoint: ["/home/vision/vision_ws/docker/entrypoint.sh"]
+    command: ["bash", "-c", "ros2 launch aruco_test localization_bringup.launch.py ${LAUNCH_ARGS:-}"]
+    restart: unless-stopped
     working_dir: /home/vision/vision_ws
     <<: *ros2-vars
     environment:
-      - ROS_DOMAIN_ID=59
+      # 59 = the robot fleet's domain. On a dev machine on the same network use another
+      # one (ROS_DOMAIN_ID=91 docker compose up -d), or this stack will collide with
+      # the nodes already running there (same node names, same topics, same TF).
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-59}
       - DISPLAY=${DISPLAY}
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - CYCLONEDDS_URI=file:///home/vision/vision_ws/config/cyclonedds.xml
       - ROS_WORKSPACE=/home/vision/vision_ws
+      - AUTO_BUILD=${AUTO_BUILD:-auto}   # auto | always | never
     volumes:
       - /dev:/dev
       - ../:/home/vision/vision_ws

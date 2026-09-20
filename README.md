@@ -33,24 +33,49 @@
 git clone <this repo> Hackathon-vision-server-localization
 cd Hackathon-vision-server-localization/docker
 docker compose build            # 第一次約 10-20 分鐘
-docker compose up -d
-docker exec -it hackathon-vision-server-ws bash
 ```
 
-容器內（`~/vision_ws` 就是 repo 根目錄，直接掛載進去）：
+> **先確認 `ROS_DOMAIN_ID`**。預設 59 是機器人團隊的 domain。
+> 同網段若已經有別台在跑同一套（相同節點名、相同 topic、相同 TF），兩邊會互相蓋掉，
+> 開發機請自己指定一個：`ROS_DOMAIN_ID=91 docker compose up -d`。
+
+---
+
+## 3. 啟動
 
 ```bash
-colcon build
-source install/setup.bash
+cd docker
+docker compose up -d        # 相機 + 外參校正 + 定位，全部起來
+docker compose logs -f      # 看 log
+docker compose stop         # 停止（不會自動重啟）
 ```
 
-記憶體不足時編譯會被系統中止（`exit 137`），改成單執行緒：
+`docker compose up -d` 做的事：
+
+1. `docker/entrypoint.sh`：`install/setup.bash` 不存在就先 `colcon build`（單執行緒，避免記憶體不足）。
+   `AUTO_BUILD=always` 每次都編、`AUTO_BUILD=never` 完全不編。
+2. `ros2 launch aruco_test localization_bringup.launch.py`：同時啟動相機、`field_calib_node`、`pnp_duck_node`。
+3. `restart: unless-stopped`：當掉會自動重啟；`docker compose stop` 之後不會自己回來。
+
+常用變化（`LAUNCH_ARGS` 會直接接到 launch 指令後面）：
 
 ```bash
-MAKEFLAGS=-j1 colcon build --parallel-workers 1
+LAUNCH_ARGS="live.compact:=true live.period:=0.1" docker compose up -d   # App 用的高頻串流
+LAUNCH_ARGS="camera:=false" docker compose up -d                        # 相機由別人啟動
+LAUNCH_ARGS="localization:=false" docker compose up -d                  # 只做外參校正
+AUTO_BUILD=always docker compose up -d                                  # 改過程式，重新編譯
+docker compose run --rm hackathon-vision-server-ws bash                 # 只要一個 shell
 ```
 
-驗證：
+手動分開啟動（開發時用，容器內三個終端機）：
+
+```bash
+ros2 launch realsense2_camera rs_launch.py      # 相機（1280x720 @30）
+ros2 launch field_calib field_calib.launch.py   # 外參校正 + 發布 map -> camera_link
+ros2 launch aruco_test pnp_duck.launch.py       # 機器人定位
+```
+
+建置與環境驗證（容器內）：
 
 ```bash
 ros2 pkg list | grep -E "aruco_test|field_calib"   # 兩個都要出現
@@ -58,25 +83,7 @@ python3 -m pytest src/field_calib/test -q          # 7 passed
 python3 tools/calib/field_edge_calib.py --selftest # 最後一行 selftest PASSED
 ```
 
-`docker/compose.yaml` 的重點：`network_mode: host`、`ipc: host`（OpenCV 顯示需要）、`ROS_DOMAIN_ID=59`、CycloneDDS。
-**同一個網段若有別台機器跑同樣的節點，請確認 `ROS_DOMAIN_ID` 不同**，否則兩邊的 topic 和 TF 會互相蓋掉。
-
----
-
-## 3. 啟動（三個終端機，都在容器內）
-
-```bash
-# 1. 相機（1280x720 @30）
-ros2 launch realsense2_camera rs_launch.py
-
-# 2. 相機外參校正 + 發布 map -> camera_link
-ros2 launch field_calib field_calib.launch.py
-
-# 3. 機器人定位
-ros2 launch aruco_test pnp_duck.launch.py
-```
-
-驗證：
+執行中驗證：
 
 ```bash
 ros2 topic hz /camera/camera/color/image_raw      # 約 30 Hz
@@ -194,7 +201,9 @@ python3 tools/sim/synthetic_tag_check.py
 
 | 症狀 | 原因與處理 |
 |---|---|
-| `colcon build` 中途被殺（exit 137） | 記憶體不足，改 `MAKEFLAGS=-j1 colcon build --parallel-workers 1` |
+| `colcon build` 中途被殺（exit 137） | 記憶體不足，改 `MAKEFLAGS=-j1 colcon build --parallel-workers 1`（entrypoint 已經是單執行緒） |
+| `docker compose up -d` 之後看到節點名稱重複 | 同網段另一台在跑同一套，換 `ROS_DOMAIN_ID` 再起 |
+| 改了程式但行為沒變 | 容器內 `colcon build` 後重啟，或 `AUTO_BUILD=always docker compose up -d` |
 | RViz 沒有 `map` frame | `field_calib_node` 沒起來，或還沒有校正結果（看它的 log） |
 | 節點名稱重複、TF 被蓋掉 | 同網段另一台用了相同 `ROS_DOMAIN_ID`，或 `rs_launch.py` 開了 `cam_tf.enable:=true`（啟動時會警告） |
 | 訂閱大張疊圖收不到影像 | 4 MB 影像 BEST_EFFORT 會被丟，改用 RELIABLE 或開 `live.compact:=true` 吃 JPEG |
@@ -212,6 +221,7 @@ python3 tools/sim/synthetic_tag_check.py
 | [FLOW.md](FLOW.md) | 兩個定位節點與校正流程的完整架構、實測數據 |
 | [DEBUG.md](DEBUG.md) | 校正 debug 畫面怎麼看、症狀對照表、全部參數 |
 | [CALIBRATION.md](CALIBRATION.md) | 外參校正的設計文件（IMU／深度／桌緣的產品化流程） |
+| [src/aruco_test/launch/localization_bringup.launch.py](src/aruco_test/launch/localization_bringup.launch.py) | compose 啟動的 bringup（相機／校正／定位各自可關） |
 | [docs/localization_flow.dot](docs/localization_flow.dot) | 架構圖原始檔（`dot -Tpng -Gdpi=130 ... -o ...png` 重畫，需要 graphviz 與中文字型） |
 
 ```
@@ -220,5 +230,5 @@ src/field_calib/     桌緣外參校正（ROS 節點 + 演算法 core + 測試�
 src/realsense_ros/   RealSense 驅動（含改過的 rs_launch.py：cam_tf.*）
 tools/calib/         離線校正工具、擷取工具（out/ 不進版控）
 tools/sim/           模擬與合成影像測試
-docker/              Dockerfile 與 compose
+docker/              Dockerfile、compose、entrypoint
 ```
